@@ -15,13 +15,16 @@ from jura_connect.profile import (
 )
 
 
-def test_list_profile_codes_returns_88_machines():
+def test_list_profile_codes_returns_89_machines():
     codes = list_profile_codes()
-    # The APK we vendored ships 88 machine XMLs.
-    assert len(codes) == 88
-    # Must include the S8 EB (EF1091) and the legacy S8 (EF536).
+    # The vendored APK ships 88 machine XMLs; EF1125 (S10) was added on
+    # top, so 89.
+    assert len(codes) == 89
+    # Must include the S8 EB (EF1091), the legacy S8 (EF536), and the
+    # S10 (EF1125).
     assert "EF1091" in codes
     assert "EF536" in codes
+    assert "EF1125" in codes
 
 
 def test_ef1091_has_s8_eb_specific_products():
