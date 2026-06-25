@@ -56,6 +56,20 @@ def test_alert_severity_lifted_from_xml_type_attribute():
     assert p.alert_by_bit[35].severity == "process"
 
 
+def test_ef1069_maps_high_byte7_status_bits():
+    """The J8 (SAS / EF1069) status frame carries bits in byte 7 that the
+    EF536 baseline codebook (which stops at bit 38) doesn't know about.
+    These are what the J8's @TF: frame actually exercises, so the profile
+    must define them. See makefu/jura-connect-hass#3."""
+    p = load_profile("EF1069")
+    # bit 54 is set in every J8 frame at idle ("ML/OZ status").
+    assert p.alert_by_bit[54].name == "ml_oz_status"
+    assert p.alert_by_bit[54].severity == "info"
+    # bit 56 toggles when a cup is placed under the coffee eye.
+    assert p.alert_by_bit[56].name == "coffee_eye_cup_detected"
+    assert p.alert_by_bit[56].severity == "info"
+
+
 def test_unknown_profile_code_raises():
     with pytest.raises(KeyError):
         load_profile("EF_NOT_A_REAL_MACHINE")
