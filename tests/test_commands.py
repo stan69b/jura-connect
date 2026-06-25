@@ -397,6 +397,55 @@ def test_kaffeebert_idle_frame_decodes_to_coffee_ready_energy_safe() -> None:
     assert "cappu_rinse_alert" not in st.active_alerts
 
 
+def test_hex_body_pads_odd_length_to_even() -> None:
+    """Regression: the J8 (SAS / EF1069) WiFi dongle emits @TF: status
+    frames of 15 hex nibbles — the 8-byte baseline frame with the final
+    low nibble of byte 7 truncated. _hex_body must pad a trailing 0 so
+    bytes.fromhex() succeeds; before this the first data fetch crashed
+    with "fromhex() arg must contain an even number of hexadecimal
+    digits". See makefu/jura-connect-hass#3."""
+    from jura_connect.client import _hex_body
+
+    # 15 nibbles -> padded to 16 -> 8 bytes, last byte's low nibble = 0.
+    data = _hex_body("@TF:000400000000020", "@TF:")
+    assert data == bytes.fromhex("0004000000000200")
+    assert len(data) == 8
+
+
+# Live @TF: frames captured from a J8 (SAS / EF1069) WiFi Connect dongle
+# by DaftHonk via `jura-connect ... --watch`. These are 15 nibbles long
+# and decode against the EF1069 profile, whose XML maps the byte-7 bits
+# (54 ml_oz_status, 56 coffee_eye_cup_detected) absent from the EF536
+# baseline codebook. See makefu/jura-connect-hass#3.
+@pytest.mark.parametrize(
+    "frame,expected",
+    [
+        ("@TF:000400000000020", {"coffee_ready", "ml_oz_status"}),
+        ("@TF:400000000000020", {"fill_water", "ml_oz_status"}),
+        (
+            "@TF:000400000000028",
+            {"coffee_ready", "ml_oz_status", "coffee_eye_cup_detected"},
+        ),
+    ],
+)
+def test_j8_odd_length_status_frame_decodes(frame: str, expected: set[str]) -> None:
+    from jura_connect.profile import load_profile
+
+    st = MachineStatus.parse(frame, profile=load_profile("EF1069"))
+    assert set(st.active_alerts) == expected
+
+
+def test_j8_no_water_tank_frame_is_an_error() -> None:
+    """The 'water tank removed' J8 capture sets bit 1 (fill_water),
+    which EF1069 types as a blocking alert -> it must land in errors,
+    not info, so the integration reports the machine as stuck."""
+    from jura_connect.profile import load_profile
+
+    st = MachineStatus.parse("@TF:400000000000020", profile=load_profile("EF1069"))
+    assert "fill_water" in st.errors
+    assert "ml_oz_status" in st.info
+
+
 def test_string_result_to_dict_passthrough(sim) -> None:
     c = _paired(sim)
     try:
