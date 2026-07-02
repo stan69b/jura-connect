@@ -277,6 +277,7 @@ _ML_PER_TICK = 5
 KIND_WATER_AMOUNT = "water_amount"
 KIND_COFFEE_STRENGTH = "coffee_strength"
 KIND_TEMPERATURE = "temperature"
+KIND_MILK_AMOUNT = "milk_amount"
 KIND_MILK_FOAM_AMOUNT = "milk_foam_amount"
 KIND_MILK_BREAK = "milk_break"
 KIND_BYPASS = "bypass"
@@ -287,6 +288,7 @@ RECIPE_PARAM_KINDS: tuple[str, ...] = (
     KIND_COFFEE_STRENGTH,
     KIND_WATER_AMOUNT,
     KIND_TEMPERATURE,
+    KIND_MILK_AMOUNT,
     KIND_MILK_FOAM_AMOUNT,
     KIND_MILK_BREAK,
     KIND_BYPASS,
@@ -410,9 +412,10 @@ class ProductDef:
 
         * byte 0 — the product code;
         * byte ``F-1`` for every XML parameter (strength at F3 → byte 2,
-          water at F4 → byte 3 in 5 ml ticks, milk foam at F6 → byte 5
-          in seconds, temperature at F7 → byte 6 as 00/01/02, bypass at
-          F10 → byte 9 in 5 ml ticks, milk break at F11 → byte 10);
+          water at F4 → byte 3 in 5 ml ticks, milk at F5 → byte 4 in
+          seconds, milk foam at F6 → byte 5 in seconds, temperature at
+          F7 → byte 6 as 00/01/02, bypass at F10 → byte 9 in 5 ml
+          ticks, milk break at F11 → byte 10);
         * **byte 8 → ``0x01``** always (a fixed structural / "recipe
           valid" byte; no bundled product uses ``F9``);
         * **``0x00`` everywhere else** ("parameter not set").
@@ -430,10 +433,13 @@ class ProductDef:
         XML catalogue *before* anything goes on the wire.
 
         **Not live-verified — may misbrew, verify on your hardware:**
-        the ``milk_foam_amount`` / ``milk_break`` encodings are inferred
-        from the XML (seconds, sent as-is), not individually confirmed.
-        Water, temperature, strength and bypass are live-verified on the
-        S8 EB.
+        the ``milk_break`` encoding is inferred from the XML (seconds,
+        sent as-is), not individually confirmed. Water, temperature,
+        strength and bypass are live-verified on the S8 EB;
+        ``milk_amount`` and ``milk_foam_amount`` are live-verified on a
+        Z10 (EA) / EF545 (Milkcoffee blob
+        ``05000812030202000100000000000000`` — milk 3 s, foam 2 s —
+        brewed with the physical pour matching both phases).
 
         Raises :class:`ValueError` on unknown override kinds, on
         out-of-range values, and when a millilitre parameter the product
@@ -623,10 +629,14 @@ def _parse_product_params(product: ET.Element) -> tuple[ProductParam, ...]:
         arg = el.get("Argument") or ""
         if not arg.startswith("F"):
             continue
-        try:
-            argument = int(arg[1:])
-        except ValueError:
+        # Strictly digits only: sub-indexed arguments like MILK_FOAM_TEMP's
+        # ``Argument="F14_1"`` would otherwise parse as int("14_1") == 141
+        # (PEP 515 underscore separators!) and blow build_recipe_hex up with
+        # an offset far outside the blob. Their wire semantics are unknown,
+        # so they are skipped rather than encoded.
+        if not arg[1:].isdigit():
             continue
+        argument = int(arg[1:])
         tag = el.tag.split("}", 1)[-1]
         items: list[SettingItem] = []
         for item in el.findall("{*}ITEM"):

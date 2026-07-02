@@ -807,10 +807,12 @@ def test_products_lists_brewable_products_with_allowed_values(sim) -> None:
         )
         assert "water" in water.cli_keys and "ml" in water.cli_keys
         assert water.live_verified is True
-        # Milk params: seconds, NOT live-verified.
+        # Milk foam: seconds, live-verified on a Z10 (EA)/EF545
+        # (3 s foam physically poured from blob byte 5). Milk break
+        # remains unverified.
         milk = by_kind["milk_foam_amount"]
         assert milk.unit == "s"
-        assert milk.live_verified is False
+        assert milk.live_verified is True
         assert by_kind["milk_break"].live_verified is False
         # format() names the product; the caveat is surfaced.
         text = cat.format()
@@ -836,33 +838,32 @@ def test_products_without_profile_is_refused(sim) -> None:
 
 
 def test_products_renders_non_overridable_param_read_only(sim) -> None:
-    """A param with no `brew` CLI alias (milk_amount on the S8/EF1091)
+    """A param with no `brew` CLI alias (grinder_ratio on the EF0000)
     must render under its kind name with a read-only annotation — never
     a blank key column — and expose settable=False in to_dict()."""
-    c = _paired_with_profile(sim, "EF1091")
+    c = _paired_with_profile(sim, "EF0000")
     try:
         cat = run_named(c, "products", [], timeout=1.0).value
-        milk = next(p for p in cat.products if p.name == "milk")  # 0x0A
-        amount = next(pp for pp in milk.params if pp.kind == "milk_amount")
+        espresso = next(p for p in cat.products if p.name == "espresso")  # 0x02
+        ratio = next(pp for pp in espresso.params if pp.kind == "grinder_ratio")
         # No CLI alias -> not settable via `brew`.
-        assert amount.cli_keys == ()
-        assert amount.settable is False
+        assert ratio.cli_keys == ()
+        assert ratio.settable is False
         # The rendered row uses the kind name, not a blank column, and
         # is annotated read-only.
-        row = amount.format()
-        assert row.split("default")[0].strip() == "milk_amount"
+        row = ratio.format()
+        assert row.split("default")[0].strip() == "grinder_ratio"
         assert "read-only: not settable via 'brew'" in row
         assert not row.startswith("     default")  # no empty key column
         # Whole-product format shows it too.
-        assert "milk_amount" in milk.format()
-        assert "read-only" in milk.format()
+        assert "grinder_ratio" in espresso.format()
+        assert "read-only" in espresso.format()
         # Structured output carries settable=False for this param.
-        d = milk.to_dict()
-        entry = next(pp for pp in d["params"] if pp["kind"] == "milk_amount")
+        d = espresso.to_dict()
+        entry = next(pp for pp in d["params"] if pp["kind"] == "grinder_ratio")
         assert entry["settable"] is False
         assert entry["cli_keys"] == []
         # A settable param (strength) still reports settable=True.
-        espresso = next(p for p in cat.products if p.name == "espresso")
         strength = next(pp for pp in espresso.params if pp.kind == "coffee_strength")
         assert strength.settable is True
         assert strength.to_dict()["settable"] is True
