@@ -243,7 +243,7 @@ app uses 40 s as its server-side timeout
 | `@HE`            | _none_            | —            | polite close |
 | `@HU?`           | `@TF:<hex>` (status frame) | `MachineStatus` | status request — the dongle just emits the next status frame |
 | `@TG:43`         | `@tg:43<12 bytes hex>` | `MaintenanceCounters` | 6 × big-endian u16 |
-| `@TG:C0`         | `@tg:C0<3 bytes hex>` | `MaintenancePercent` | 1 byte per cleaning / filter / decalc (`0xFF` = N/A) |
+| `@TG:C0`         | `@tg:C0<3 bytes hex>` | `MaintenancePercent` | 1 byte per cleaning / filter / descale (`0xFF` = N/A) |
 | `@TS:01`         | `@TB` then `@ts`  | str | lock the front-panel display |
 | `@TS:00`         | `@ts`             | str | unlock the display |
 | `@TM:<addr>`     | `@tm:<addr>...`   | str | memory / setting read (firmware-specific) |
@@ -269,7 +269,7 @@ the `<BANK Command="@TG:43">` section of the machine XML
 ```
 [0..2]  cleaning
 [2..4]  filter_change
-[4..6]  decalc
+[4..6]  descale
 [6..8]  cappu_rinse
 [8..10] coffee_rinse
 [10..12] cappu_clean
@@ -306,7 +306,7 @@ The client decodes the well-known S8 alert set (cf.
 | ---------- | --------------- | ------- |
 | `block`    | `error`         | the machine is genuinely stuck and needs user action (insert tray, fill water, …) |
 | `info` or none | `info`      | informational state or low-supply reminder (`no_beans` with `Blocked="C"`, `heating_up`, `coffee_ready`, …) — not an error, just a flag |
-| `ip`       | `process`       | a "schedule maintenance" prompt (decalc / cleaning / filter / cappu rinse alerts) shown *before* it actually blocks brewing |
+| `ip`       | `process`       | a "schedule maintenance" prompt (descale / cleaning / filter / cappu rinse alerts) shown *before* it actually blocks brewing |
 
 Live frame from Kaffeebert at idle: `@TF:0004000008000000`. Byte 1 =
 `0x04` → MSB-position 5 set → global bit 13 = `coffee_ready`
@@ -501,7 +501,7 @@ the same prefix check.
 | `@TG:21` | start `CappuClean` |
 | `@TG:23` | start `CappuRinse` |
 | `@TG:24` | start `Cleaning` |
-| `@TG:25` | start `Decalc` |
+| `@TG:25` | start descaling (`descale` command) |
 | `@TG:26` | start `FilterChange` |
 | `@TG:7E` | reset maintenance counters |
 | `@TG:FF` | reset (something) |
@@ -547,6 +547,21 @@ show. What it executes is a **16-byte recipe blob**:
   Jutta-Proto Bluetooth finding "1 second = 5 ml". XML `Value`/ `Min`/
   `Max` attributes are in ml. Milk foam and milk break are seconds,
   sent as-is; strength is the level number.
+* **Bypass and milk-foam / milk-break encodings are NOT live-verified
+  — they may misbrew; verify on your hardware.** Bypass shares
+  water's ml÷5 tick semantics in the XML and milk values are treated
+  as seconds, but only water and temperature have been confirmed
+  against a physical machine (E8 (EB) / EF538). The library exposes
+  these overrides anyway (with the same caveat in the docstrings).
+* **Firmware-family layout differences exist.** The blob above (FF
+  padding, no byte-8 flag) is the E8 (EB) / EF538 layout. E6-family
+  vectors observed in the wild are **00-padded** and set byte 8 to
+  `01` — e.g. `@TP:02000809000002000100000000000000` (default
+  Espresso) and `@TP:0300021A000001000100000000000000` (Coffee,
+  strength 2, 130 ml, normal). The offsets and ml÷5 scaling still
+  hold, but the padding/flag differ, so the builder's FF-padded blob
+  will not be byte-identical on those machines. Use the verbatim-blob
+  escape hatch there until the layout is confirmed.
 * **`FF` means "parameter not set"** — for parameters the product
   doesn't have. *Never* leave a parameter the product does have at
   `FF`: an unset water byte reads as 255 ticks ≈ **1.275 litres** of
@@ -559,7 +574,8 @@ show. What it executes is a **16-byte recipe blob**:
   (byte 4 = current tick, byte 5 = target ticks, second-to-last byte =
   percent 0x00–0x64), and `@TV:3E<code>` on completion.
 * A machine in `energy_safe` wakes on the first `@TP:` but may ignore
-  that first command; the retry then brews.
+  that first command; a retry then brews. `JuraClient.brew(retry=True)`
+  opts into resending the blob once if the first reply isn't `@tp`.
 
 The named `brew` command builds this blob from the machine profile —
 `brew hotwater water=220 temp=high` — validating every value against

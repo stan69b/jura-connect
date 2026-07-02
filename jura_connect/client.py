@@ -40,7 +40,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 
-from . import protocol
+from . import profile, protocol
 from .profile import MachineProfile, ProductDef, SettingDef
 
 DEFAULT_PORT = 51515
@@ -79,6 +79,19 @@ class HandshakeResult:
 
 
 _HP_RE = re.compile(r"^@hp([45])(?::(.*))?$")
+
+
+def _capped_join(items: list[str], limit: int = 10) -> str:
+    """Join ``items`` with commas, truncating to ``limit`` with an ellipsis.
+
+    Product profiles carry 80+ names on some models; an error message
+    that dumps all of them is unreadable, so cap the list.
+    """
+    if not items:
+        return "(none)"
+    if len(items) <= limit:
+        return ", ".join(items)
+    return ", ".join(items[:limit]) + f", … (+{len(items) - limit} more)"
 
 
 def _classify(reply: str) -> HandshakeResult:
@@ -727,13 +740,25 @@ class JuraClient:
         )
 
     # -- brewing ---------------------------------------------------------
-    def resolve_product(self, product: str | int) -> ProductDef:
+    def resolve_product(
+        self, product: str | int, *, substring: bool = False
+    ) -> ProductDef:
         """Resolve a product by code, snake_case name, or 2-hex code.
 
-        Accepts an int product code (``0x0D``), a snake_case name from
-        the profile (``"espresso"``; unambiguous substrings are OK, so
-        ``"hotwater"`` finds ``hotwater_portion_normal``), or the
-        2-char hex code (``"0D"``). Requires :attr:`profile`.
+        Accepts an int product code (``0x0D``), a 2-char hex code
+        (``"0D"``), or a snake_case name from the profile
+        (``"espresso"``). Resolution order for a string:
+
+        1. an exact 2-hex product code (``"0D"``) — checked *before*
+           names so a code is never mistaken for a name prefix;
+        2. an exact snake_case name;
+        3. a name *prefix* (``"hotwater"`` → ``hotwater_portion_normal``)
+           when unambiguous.
+
+        Set ``substring=True`` to also match anywhere in the name
+        (opt-in only — the default prefix match keeps ``"esp"`` from
+        silently resolving to a milk drink that merely contains it).
+        Requires :attr:`profile`.
         """
         if self.profile is None:
             raise RuntimeError(
@@ -749,12 +774,20 @@ class JuraClient:
                 f"{self.profile.code} catalogue."
             )
         text = product.strip()
-        # snake_case name, exact then unambiguous-substring.
+        # 2-char hex product code first ("0D") — before any name match.
+        if re.fullmatch(r"[0-9A-Fa-f]{2}", text):
+            code = int(text, 16)
+            if code in catalogue:
+                return catalogue[code]
         target = text.lower()
         by_name = {p.name: p for p in self.profile.products}
         if target in by_name:
             return by_name[target]
-        matches = [p for p in self.profile.products if target in p.name]
+        # Name prefix match (or substring when explicitly opted in).
+        if substring:
+            matches = [p for p in self.profile.products if target in p.name]
+        else:
+            matches = [p for p in self.profile.products if p.name.startswith(target)]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
@@ -763,12 +796,7 @@ class JuraClient:
                 f"product {product!r} is ambiguous on {self.profile.code}; "
                 f"matches {names}"
             )
-        # 2-char hex code fallback ("0D").
-        if re.fullmatch(r"[0-9A-Fa-f]{2}", text):
-            code = int(text, 16)
-            if code in catalogue:
-                return catalogue[code]
-        known = ", ".join(sorted(by_name)) or "(none)"
+        known = _capped_join(sorted(by_name))
         raise ValueError(
             f"product {product!r} not known on profile {self.profile.code}. "
             f"Known: {known}"
@@ -784,6 +812,8 @@ class JuraClient:
         milk_foam: int | None = None,
         milk_break: int | None = None,
         bypass: int | None = None,
+        substring: bool = False,
+        retry: bool = False,
         timeout: float = 6.0,
     ) -> str:
         """Start brewing a product (``@TP:<recipe blob>``).
@@ -792,13 +822,19 @@ class JuraClient:
         dispenses at the spout. Make sure a suitable cup is in place;
         there is no remote abort.
 
-        ``product`` is resolved via :meth:`resolve_product`. Recipe
-        parameters use XML units — ``ml`` for water, brew ``strength``
-        level, ``temperature`` as ITEM name (``"low"`` / ``"normal"`` /
-        ``"high"``) or value, ``milk_foam`` / ``milk_break`` in
-        seconds, ``bypass`` in ml. Anything left ``None`` falls back to
-        the XML default for this product. Values are validated against
-        the machine XML before going on the wire.
+        ``product`` is resolved via :meth:`resolve_product` (pass
+        ``substring=True`` to widen name matching). Recipe parameters
+        use XML units — ``ml`` for water, brew ``strength`` level,
+        ``temperature`` as ITEM name (``"low"`` / ``"normal"`` /
+        ``"high"``) or value, ``milk_foam`` / ``milk_break`` in seconds,
+        ``bypass`` in ml. Anything left ``None`` falls back to the XML
+        default for this product. Values are validated against the
+        machine XML before going on the wire.
+
+        **Not live-verified — may misbrew, verify on your hardware:**
+        ``bypass``, ``milk_foam`` and ``milk_break`` are encoded from
+        the XML (ml ÷5 ticks, seconds as-is) but not confirmed on a
+        physical machine. Water and temperature are live-verified.
 
         The wire format is a 16-byte blob (verified live on an E8 (EB)
         / EF538): byte 0 is the product code; each XML parameter lands
@@ -807,24 +843,33 @@ class JuraClient:
         TT237W-family WiFi firmware, and an unset water byte means 255
         ticks ≈ 1.3 l, so always send the full validated blob.
 
+        ``retry=True`` sends the blob a second time if the first reply
+        is not an ``@tp`` accept: a machine in ``energy_safe`` wakes on
+        the first ``@TP:`` but may ignore it (see PROTOCOL.md §5.9).
+
         Returns the dongle's reply (``"@tp"`` on accept). The machine
         then emits ``@TB`` (brew start) and ``@TV:`` progress frames,
         observable via :meth:`iter_frames`.
         """
-        definition = self.resolve_product(product)
+        definition = self.resolve_product(product, substring=substring)
         overrides: dict[str, int | str] = {}
         for kind, value in (
-            ("water_amount", ml),
-            ("coffee_strength", strength),
-            ("temperature", temperature),
-            ("milk_foam_amount", milk_foam),
-            ("milk_break", milk_break),
-            ("bypass", bypass),
+            (profile.KIND_WATER_AMOUNT, ml),
+            (profile.KIND_COFFEE_STRENGTH, strength),
+            (profile.KIND_TEMPERATURE, temperature),
+            (profile.KIND_MILK_FOAM_AMOUNT, milk_foam),
+            (profile.KIND_MILK_BREAK, milk_break),
+            (profile.KIND_BYPASS, bypass),
         ):
             if value is not None:
                 overrides[kind] = value
         recipe = definition.build_recipe_hex(overrides)
-        return self.request(f"@TP:{recipe}", timeout=timeout)
+        reply = self.request(f"@TP:{recipe}", timeout=timeout)
+        if retry and not reply.lower().startswith("@tp"):
+            # Energy-safe wake-up: the first @TP: only woke the machine;
+            # resend now that it is awake.
+            reply = self.request(f"@TP:{recipe}", timeout=timeout)
+        return reply
 
     @staticmethod
     def random_conn_id() -> str:
@@ -895,7 +940,7 @@ class MaintenanceCounters:
 
     cleaning: int
     filter_change: int
-    decalc: int
+    descale: int
     cappu_rinse: int
     coffee_rinse: int
     cappu_clean: int
@@ -910,7 +955,7 @@ class MaintenanceCounters:
         return cls(
             cleaning=u[0],
             filter_change=u[1],
-            decalc=u[2],
+            descale=u[2],
             cappu_rinse=u[3],
             coffee_rinse=u[4],
             cappu_clean=u[5],
@@ -920,7 +965,7 @@ class MaintenanceCounters:
     def format(self) -> str:
         return (
             f"cleaning={self.cleaning} filter={self.filter_change} "
-            f"decalc={self.decalc} cappu_rinse={self.cappu_rinse} "
+            f"descale={self.descale} cappu_rinse={self.cappu_rinse} "
             f"coffee_rinse={self.coffee_rinse} cappu_clean={self.cappu_clean}"
         )
 
@@ -928,7 +973,7 @@ class MaintenanceCounters:
         return {
             "cleaning": self.cleaning,
             "filter_change": self.filter_change,
-            "decalc": self.decalc,
+            "descale": self.descale,
             "cappu_rinse": self.cappu_rinse,
             "coffee_rinse": self.coffee_rinse,
             "cappu_clean": self.cappu_clean,
@@ -942,7 +987,7 @@ class MaintenancePercent:
 
     cleaning: int
     filter_change: int
-    decalc: int
+    descale: int
     raw: bytes
 
     @classmethod
@@ -953,20 +998,18 @@ class MaintenancePercent:
         return cls(
             cleaning=data[0],
             filter_change=data[1],
-            decalc=data[2],
+            descale=data[2],
             raw=data,
         )
 
     def format(self) -> str:
-        return (
-            f"cleaning={self.cleaning} filter={self.filter_change} decalc={self.decalc}"
-        )
+        return f"cleaning={self.cleaning} filter={self.filter_change} descale={self.descale}"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "cleaning": self.cleaning,
             "filter_change": self.filter_change,
-            "decalc": self.decalc,
+            "descale": self.descale,
             "raw_hex": self.raw.hex().upper(),
         }
 
@@ -985,7 +1028,7 @@ class MaintenancePercent:
 #     Blocked="C" blocks coffee but isn't an error from the user's
 #     perspective — the bin just needs refilling).
 #   * "process" -> XML Type="ip": an in-process / reminder bit, typically
-#     a "schedule maintenance" prompt (decalc / cleaning / filter / cappu
+#     a "schedule maintenance" prompt (descale / cleaning / filter / cappu
 #     rinse) that the user is supposed to action eventually.
 _STATUS_BITS: dict[int, tuple[str, str]] = {
     0: ("insert_tray", "error"),
@@ -1021,7 +1064,7 @@ _STATUS_BITS: dict[int, tuple[str, str]] = {
     30: ("error_status", "error"),
     31: ("enjoy_product", "info"),
     32: ("filter_alert", "process"),
-    33: ("decalc_alert", "process"),
+    33: ("descale_alert", "process"),
     34: ("cleaning_alert", "process"),
     35: ("cappu_rinse_alert", "process"),
     36: ("energy_safe", "info"),
@@ -1040,7 +1083,7 @@ class MachineStatus:
     user actually needs to action right now; ``info`` covers normal
     state transitions and low-supply reminders (e.g. "no beans" when the
     bean container is low — informational, not an error); ``process``
-    holds the periodic maintenance prompts (decalc / cleaning / filter /
+    holds the periodic maintenance prompts (descale / cleaning / filter /
     cappu rinse) which the machine surfaces *before* they block brewing.
 
     ``active_alerts`` is kept as the union of all active named bits for
