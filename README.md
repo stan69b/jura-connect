@@ -17,7 +17,8 @@ end-to-end against a **JURA S8 EB** running firmware **TT237W V06.11**
 | storage of authentication codes | ✓ |
 | Read commands: maintenance counters, maintenance %, machine status / alerts, screen lock/unlock | ✓ |
 | Per-machine profiles — 88 bundled XMLs from the J.O.E. APK; alert names + product codes are looked up per `EF_code` so a Cortado on an S8 EB names itself, not `0x2B=2` | ✓ |
-| Brewing / writes / maintenance processes | available but require extra attention |
+| Brewing by product name — `brew hotwater water=220 temp=high` — with water / strength / temperature / milk overrides validated against the machine XML | ✓ ; the `@TP:` recipe-blob format is verified by physically brewing on a JURA S8 EB (EF1091) and an E6, see §5.9 of [`docs/PROTOCOL.md`](docs/PROTOCOL.md) |
+| Other writes / maintenance processes | available but require extra attention |
 
 ## Installation
 
@@ -122,6 +123,7 @@ available commands:
     percent                  maintenance percent indicators (@TG:C0)
     status                   parsed status / active alerts (@HU? -> @TF:)
     brews                    per-product brew counters (@TR:32 paginated; 16 pages)
+    products                 list brewable products + allowed 'brew' param=value values (profile-driven; no I/O)
     pmode                    programmable-recipe slots (@TM:50 + @TM:42,<slot>); per-machine
     setting <name> [<value>] read or write a machine setting; profile-aware; write is gated
     lock                     lock the front-panel display (@TS:01)
@@ -132,14 +134,14 @@ available commands:
 
   destructive (require --allow-destructive-commands; see 'jura-connect command --help'):
     clean                    [destructive] start coffee-system cleaning cycle (@TG:24)
-    decalc                   [destructive] start descaling cycle (@TG:25)
+    descale                   [destructive] start descaling cycle (@TG:25)
     filter-change            [destructive] run water-filter change procedure (@TG:26)
     cappu-clean              [destructive] start cappuccino-system cleaning (@TG:21)
     cappu-rinse              [destructive] rinse the milk system (@TG:23)
     reset-counters           [destructive] zero every maintenance counter (@TG:7E)
     restart                  [destructive] reboot the WiFi dongle (@TF:02)
     power-off                [destructive] put the machine into standby (@AN:02)
-    brew <recipe>            [destructive] start brewing a recipe (@TP:<recipe>)
+    brew <product> [<param=value>…]  [destructive] start brewing a product (@TP:<recipe blob>)
     set-pin <pin>            [destructive] write a new front-panel PIN (@HW:01,<pin>)
     set-ssid <ssid>          [destructive] write a new WiFi SSID for the dongle (@HW:80,<ssid>)
     set-password <password>  [destructive] write a new WiFi password (@HW:81,<pwd>)
@@ -160,12 +162,12 @@ handshake -> CORRECT  (@hp4)
   errors         : (none)
   info flags     : coffee_ready, energy_safe
   process flags  : (none)
-  maintenance    : cleaning=21 filter=1 decalc=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
-  maintenance %  : cleaning=80 filter=255 decalc=30
+  maintenance    : cleaning=21 filter=1 descale=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
+  maintenance %  : cleaning=80 filter=255 descale=30
 
 $ jura-connect command --name Kaffeebert counters
 handshake -> CORRECT  (@hp4)
-cleaning=21 filter=1 decalc=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
+cleaning=21 filter=1 descale=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
 
 $ jura-connect command --name Kaffeebert status
 handshake -> CORRECT  (@hp4)
@@ -199,7 +201,7 @@ Status output distinguishes blocking **errors** (machine is stuck,
 user must act) from **info** flags (low-supply reminders and
 state-of-being bits such as `no_beans`, `coffee_ready`,
 `energy_safe`) and **process** flags (periodic maintenance prompts
-such as `cleaning_alert` and `decalc_alert`). The unsplit
+such as `cleaning_alert` and `descale_alert`). The unsplit
 ``active_alerts`` is still on the dataclass for backwards
 compatibility.
 
@@ -288,7 +290,7 @@ $ jura-connect command --name Kaffeebert --json counters | jq .
   "value": {
     "cleaning": 21,
     "filter_change": 1,
-    "decalc": 8,
+    "descale": 8,
     "cappu_rinse": 344,
     "coffee_rinse": 3617,
     "cappu_clean": 91,
@@ -304,6 +306,102 @@ responses) come through as ``payload["value"]`` directly. Every
 structured result type — `MaintenanceCounters`, `MaintenancePercent`,
 `MachineStatus`, `MachineInfo`, `CommandResult` — exposes the same
 `to_dict()` from Python.
+
+### Brew a product (`brew`)
+
+Not sure what to type? `products` lists every brewable product on the
+connected machine with its resolvable name and each `param=value`
+key's allowed values (ranges/steps for water & milk, item choices for
+strength & temperature), read straight from the machine profile with
+no extra machine I/O:
+
+```sh
+$ jura-connect command --name Kaffeebert --machine-type EF538 products
+EF538 — 14 brewable product(s)
+
+espresso  (0x02)
+    strength / coffee_strength   default 8        choices: 1=01, 2=02, …, 10=0A
+    ml / water / water_amount    default 45       range 15–80 ml, step 5 (value ÷ 5 = 5 ml wire ticks)
+    temp / temperature           default high     choices: low=00, normal=01, high=02
+
+latte_macchiato  (0x07)
+    …
+    milk / milk_foam / milk_foam_amount default 22  range 1–120 s, step 1 (seconds, sent as-is)  [not live-verified — may misbrew, verify on your hardware]
+```
+
+`brew` starts a product by its 2-hex product code, by its profile
+name, or — as an escape hatch — by a full verbatim recipe blob (32+
+hex chars). Name resolution is: an exact 2-hex code first, then an
+exact snake_case name, then an unambiguous name *prefix* (so
+`hotwater` finds `hotwater_portion_normal` but `esp` is rejected as
+ambiguous). Pass `substring=True` to `JuraClient.resolve_product` /
+`brew` to widen matching to anywhere in the name. Optional
+`param=value` arguments (an uncapped variadic list) override the
+machine XML's defaults; every value is validated against the XML
+catalogue (range, step, allowed items) before anything goes on the
+wire:
+
+```sh
+# Hot water with the XML default quantity (here: 220 ml)
+$ jura-connect command --name Kaffeebert --allow-destructive-commands \
+    brew hotwater
+handshake -> CORRECT  (@hp4)
+@tp
+
+# An espresso, stronger and shorter than the default
+$ jura-connect command --name Kaffeebert --allow-destructive-commands \
+    brew espresso water=35 strength=7
+
+# Cappuccino with more milk foam, high temperature
+$ jura-connect command --name Kaffeebert --allow-destructive-commands \
+    brew cappuccino milk=20 temp=high
+
+# Out-of-catalogue values never reach the machine
+$ jura-connect command --name Kaffeebert --allow-destructive-commands \
+    brew hotwater water=9999
+refused: water_amount: 9999 is outside [25, 450]
+```
+
+Parameter keys: `water`/`ml` (millilitres), `strength` (level),
+`temp`/`temperature` (`low` / `normal` / `high`), `milk` (seconds),
+`milk_break` (seconds), `bypass` (millilitres). Which parameters a
+product accepts comes from its machine-XML entry.
+
+> **Bypass and milk overrides are not live-verified — they may
+> misbrew, so verify them on your hardware.** `bypass`, `milk`
+> (milk-foam) and `milk_break` are encoded from the XML (ml kinds ÷5
+> ticks, seconds as-is) but have not been confirmed against a physical
+> machine. Only water and temperature are live-verified.
+> **Twin models** (e.g. J8/J10 "twin") and any product with a
+> `grinder_ratio` parameter are untested — their blob layout may
+> differ. Machines whose dongle stays silent on UDP discovery need
+> `set-machine-type <name> <EF>` once before `products` / `brew` map to
+> the right catalogue instead of the EF536 baseline.
+
+The wire command is **not** a bare product code, and **not** an
+FF-padded blob: the firmware ACKs both with `@tp:00` and silently
+ignores them. The working format is a 16-byte recipe blob with the
+product code at byte 0, each XML parameter at its `Argument` offset
+minus one (water/bypass in 5 ml ticks), **byte 8 = `0x01`** (a
+constant "recipe valid" byte), and every other byte `0x00`. An unset
+water byte is `0x00` = no water, so `brew` refuses to leave a water
+parameter unset and always sends the full validated blob. An accepted
+blob replies with a bare `@tp` (then `@TB`/`@TV` frames); `@tp:00`
+means rejected. See §5.9 of [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for
+the layout, verified by physically brewing on a JURA S8 EB (EF1091)
+and an E6.
+
+From Python:
+
+```python
+from jura_connect import JuraClient, load_profile
+
+with JuraClient(addr, conn_id=cid, auth_hash=h,
+                profile=load_profile("EF538")) as c:
+    c.brew("hotwater", ml=220)                      # '@tp' on accept
+    c.brew("espresso", strength=7, temperature="high")
+    # then watch @TB / @TV:41… progress / @TV:3E… done via c.iter_frames()
+```
 
 ### Destructive commands (gated)
 
@@ -394,7 +492,7 @@ with JuraClient(creds.address, conn_id=creds.conn_id,
     for spec in list_commands():
         print(spec.usage(), "—", spec.description)
     result = run_named(c, "counters")
-    print(result.format())             # cleaning=21 filter=1 decalc=8 …
+    print(result.format())             # cleaning=21 filter=1 descale=8 …
 ```
 
 ## Tests, lint, and type-check

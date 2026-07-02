@@ -243,7 +243,7 @@ app uses 40 s as its server-side timeout
 | `@HE`            | _none_            | —            | polite close |
 | `@HU?`           | `@TF:<hex>` (status frame) | `MachineStatus` | status request — the dongle just emits the next status frame |
 | `@TG:43`         | `@tg:43<12 bytes hex>` | `MaintenanceCounters` | 6 × big-endian u16 |
-| `@TG:C0`         | `@tg:C0<3 bytes hex>` | `MaintenancePercent` | 1 byte per cleaning / filter / decalc (`0xFF` = N/A) |
+| `@TG:C0`         | `@tg:C0<3 bytes hex>` | `MaintenancePercent` | 1 byte per cleaning / filter / descale (`0xFF` = N/A) |
 | `@TS:01`         | `@TB` then `@ts`  | str | lock the front-panel display |
 | `@TS:00`         | `@ts`             | str | unlock the display |
 | `@TM:<addr>`     | `@tm:<addr>...`   | str | memory / setting read (firmware-specific) |
@@ -269,7 +269,7 @@ the `<BANK Command="@TG:43">` section of the machine XML
 ```
 [0..2]  cleaning
 [2..4]  filter_change
-[4..6]  decalc
+[4..6]  descale
 [6..8]  cappu_rinse
 [8..10] coffee_rinse
 [10..12] cappu_clean
@@ -306,7 +306,7 @@ The client decodes the well-known S8 alert set (cf.
 | ---------- | --------------- | ------- |
 | `block`    | `error`         | the machine is genuinely stuck and needs user action (insert tray, fill water, …) |
 | `info` or none | `info`      | informational state or low-supply reminder (`no_beans` with `Blocked="C"`, `heating_up`, `coffee_ready`, …) — not an error, just a flag |
-| `ip`       | `process`       | a "schedule maintenance" prompt (decalc / cleaning / filter / cappu rinse alerts) shown *before* it actually blocks brewing |
+| `ip`       | `process`       | a "schedule maintenance" prompt (descale / cleaning / filter / cappu rinse alerts) shown *before* it actually blocks brewing |
 
 Live frame from Kaffeebert at idle: `@TF:0004000008000000`. Byte 1 =
 `0x04` → MSB-position 5 set → global bit 13 = `coffee_ready`
@@ -501,13 +501,13 @@ the same prefix check.
 | `@TG:21` | start `CappuClean` |
 | `@TG:23` | start `CappuRinse` |
 | `@TG:24` | start `Cleaning` |
-| `@TG:25` | start `Decalc` |
+| `@TG:25` | start descaling (`descale` command) |
 | `@TG:26` | start `FilterChange` |
 | `@TG:7E` | reset maintenance counters |
 | `@TG:FF` | reset (something) |
 | `@TF:02` | restart machine |
 | `@AN:02` | power off |
-| `@TP:<recipe>` | start brewing a product |
+| `@TP:<recipe blob>` | start brewing a product — see §5.9 |
 | `@HW:01,<pin>` | set machine PIN |
 | `@HW:80,<ssid>` | set WiFi SSID |
 | `@HW:81,<pwd>` | set WiFi password |
@@ -515,6 +515,102 @@ the same prefix check.
 
 Use these only via raw `JuraClient.request()` and only with explicit
 intent — running `@TG:24` will start a real cleaning cycle.
+
+### 5.9 Product start (`@TP:`) — the recipe blob (verified live)
+
+Verified by **physically brewing** on a **JURA S8 EB / EF1091**
+(owner's machine "kaffeebert", 2026-07) and, independently, on an
+**E6** (upstream PR author's machine). Brewing works, but **not** with
+a bare product code and **not** with the FF-padded blob earlier
+versions of this library sent — both are ACKed and then silently
+ignored. What the machine executes is a **16-byte recipe blob whose
+unused bytes are `0x00` and whose byte 8 is a constant `0x01`**:
+
+```
+@TP:28000709000001000109000000000000   (cafe_barista, strength 7, 45 ml, normal, bypass 45 ml)
+     │ │ │ │ │ │ │ │ │ └────────────── bytes 10..15: 00 (unused here)
+     │ │ │ │ │ │ │ │ └──────────────── byte 9:  bypass, 5 ml ticks (0x09 = 9 = 45 ml)
+     │ │ │ │ │ │ │ └────────────────── byte 8:  0x01 — constant "recipe valid" byte
+     │ │ │ │ │ │ └──────────────────── byte 7:  00 (unused here)
+     │ │ │ │ │ └────────────────────── byte 6:  temperature (00 low / 01 normal / 02 high)
+     │ │ │ │ └──────────────────────── byte 5:  milk-foam amount, seconds (unused here)
+     │ │ │ └────────────────────────── byte 4:  00 (unused here)
+     │ │ └──────────────────────────── byte 3:  water amount, 5 ml ticks (0x09 = 9 = 45 ml)
+     │ └────────────────────────────── byte 2:  coffee strength level (0x07 = 7)
+     └──────────────────────────────── byte 0:  product code (byte 1 unused = 00)
+```
+
+* **Padding is `0x00`, and byte 8 is always `0x01`.** An FF-padded
+  blob (`@TP:28FF0709FFFF01FFFF09FF…`) is ACKed `@tp:00` and does
+  **nothing** — no `@TB`/`@TV` frames, counter unchanged, tried both
+  single- and double-send. The 00-padded, byte-8=01 form brews on the
+  first send. Byte 8 is a fixed structural byte: no bundled product
+  carries a parameter there (nothing uses `Argument="F9"`).
+* **Byte positions come from the machine XML.** Every PRODUCT element
+  lists its parameters with an `Argument="F<n>"` attribute
+  (COFFEE_STRENGTH at F3, WATER_AMOUNT at F4, MILK_FOAM_AMOUNT at F6,
+  TEMPERATURE at F7, BYPASS at F10, MILK_BREAK at F11). The F-numbers
+  are the byte offsets of the *Bluetooth* start-product command, which
+  carries a leading key byte; the WiFi blob does not, so **blob offset
+  = F − 1**.
+* **Water and bypass are sent in 5 ml ticks** (`ml / 5`, one byte).
+  XML `Value`/`Min`/`Max` attributes are in ml. Milk foam and milk
+  break are seconds, sent as-is; strength is the level number;
+  temperature is the ITEM value (00/01/02).
+* **Live-verified:** water, temperature, strength and bypass, from the
+  three cross-model vectors (S8 EB `cafe_barista`, E6 `espresso`, E6
+  `coffee`). **Not individually live-verified — may misbrew, verify on
+  your hardware:** `milk_foam_amount` / `milk_break` (seconds, as-is).
+* **`0x00` means "parameter not set"** — for parameters the product
+  doesn't have. A water byte the product *does* have must still be set
+  explicitly: with 00-padding an unset water byte is `0x00` = **no
+  water** (a dry/short shot), so `build_recipe_hex` refuses to leave it
+  unset rather than guess.
+* Cross-model verified vectors (all 00-padded, byte 8 = 01):
+  `@TP:28000709000001000109000000000000` (S8 EB cafe_barista),
+  `@TP:02000809000002000100000000000000` (E6 default espresso),
+  `@TP:0300021A000001000100000000000000` (E6 coffee, strength 2,
+  130 ml, normal).
+* No trailing checksum is needed (unlike `@TM:` writes), and no
+  `@TS:01`/`@TS:00` lock wrapper is required.
+* Reply behaviour: the dongle ACKs an **accepted** blob with a bare
+  `@tp`, then emits `@TB` when the brew starts, `@TV:41<code>…`
+  progress frames (byte 4 = current tick, byte 5 = target ticks,
+  second-to-last byte = percent 0x00–0x64), and `@TV:3E<code>` on
+  completion. A **rejected/ignored** blob gets `@tp:00` and no further
+  frames — `@tp:00` is *not* an accept.
+* A machine in `energy_safe` wakes on the first `@TP:` but may ignore
+  that first command; a retry then brews. `JuraClient.brew(retry=True)`
+  opts into resending the blob once if the first reply is not an accept
+  (bare `@tp`). With the correct 00-pad/byte-8=01 layout it brews on
+  the first send, so the retry is usually moot.
+* **Untested variants — verify on your hardware.** Live end-to-end
+  verification exists only for single-boiler coffee machines (S8 EB /
+  EF1091 by the maintainer, E6 by the upstream PR author). **Twin
+  models** (e.g. J8/J10 "twin") and any product carrying a
+  `grinder_ratio` parameter are **untested** — their blob layout may
+  differ; report back if a brew is ACKed `@tp` but nothing pours.
+* The dongle serves **one TCP session at a time**. Back-to-back
+  commands may hit a connection refusal for a moment after the previous
+  session closes — wait briefly and retry.
+* Brew builds the blob from the machine **profile**, so a machine whose
+  dongle stays silent on UDP discovery (no auto-detected EF code) must
+  have its model set once — `set-machine-type <name> <EF>` (or
+  `--machine-type <EF>`) — before `products` / `brew` resolve products
+  against the right catalogue instead of the EF536 baseline.
+
+The named `brew` command builds this blob from the machine profile —
+`brew hotwater water=220 temp=high` — validating every value against
+the XML catalogue (range, step, allowed items) before it goes on the
+wire. `JuraClient.brew()` / `ProductDef.build_recipe_hex()` are the
+library entry points; a full hex blob is still accepted verbatim as
+an escape hatch for firmware variants with a different layout.
+
+The `products` command lists every brewable product on the connected
+machine with its resolvable name and each `param=value` key's allowed
+values (ranges/steps for water & milk, item choices for strength &
+temperature) — built from the same profile, with no extra machine
+I/O. Use it to discover exactly what `brew` accepts.
 
 ---
 

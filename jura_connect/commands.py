@@ -10,7 +10,7 @@ The registry is split into two tiers:
 * **Read-only commands** (``info``, ``counters``, ``status``, …) — safe
   to invoke at any time. The CLI lets these through unconditionally.
 
-* **Destructive commands** (``clean``, ``decalc``, ``set-pin``, …) —
+* **Destructive commands** (``clean``, ``descale``, ``set-pin``, …) —
   these change the machine's physical state, consume supplies, can
   lock you out of the dongle (wrong PIN / WiFi credentials), or kick
   off long-running cycles you cannot abort remotely. They are gated
@@ -28,9 +28,12 @@ escape hatch can't be used as an accidental bypass.
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections.abc import Callable, Sequence
 
+from . import profile
 from .client import JuraClient
+from .profile import RECIPE_BLOB_BYTES
 
 CommandRunner = Callable[["CommandSpec", JuraClient, "tuple[str, ...]", float], object]
 
@@ -42,7 +45,7 @@ DESTRUCTIVE_PREFIXES: tuple[bytes, ...] = (
     b"@TG:21",  # CappuClean
     b"@TG:23",  # CappuRinse
     b"@TG:24",  # Cleaning
-    b"@TG:25",  # Decalc
+    b"@TG:25",  # Descale
     b"@TG:26",  # FilterChange
     b"@TG:7E",  # reset maintenance counter (with or without arg)
     b"@TG:FF",  # reset (broad)
@@ -69,11 +72,17 @@ class DestructiveCommandError(CommandError):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class Argument:
-    """One positional argument accepted by a :class:`CommandSpec`."""
+    """One positional argument accepted by a :class:`CommandSpec`.
+
+    ``variadic=True`` marks a trailing argument that soaks up zero or
+    more values (like ``nargs="*"``). It must be the last argument in a
+    :class:`CommandSpec`, and implies ``optional``.
+    """
 
     name: str
     help: str
     optional: bool = False  # if True, the arg may be omitted on the CLI
+    variadic: bool = False  # if True, soaks up all remaining values
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -100,9 +109,14 @@ class CommandSpec:
     def usage(self) -> str:
         if not self.arguments:
             return self.name
-        parts = [
-            f"[<{a.name}>]" if a.optional else f"<{a.name}>" for a in self.arguments
-        ]
+        parts = []
+        for a in self.arguments:
+            if a.variadic:
+                parts.append(f"[<{a.name}>...]")
+            elif a.optional:
+                parts.append(f"[<{a.name}>]")
+            else:
+                parts.append(f"<{a.name}>")
         return f"{self.name} " + " ".join(parts)
 
     def run(
@@ -113,14 +127,20 @@ class CommandSpec:
         timeout: float,
         allow_destructive: bool = False,
     ) -> CommandResult:
-        required = sum(1 for a in self.arguments if not a.optional)
-        if not required <= len(args) <= len(self.arguments):
+        required = sum(1 for a in self.arguments if not a.optional and not a.variadic)
+        has_variadic = any(a.variadic for a in self.arguments)
+        upper = float("inf") if has_variadic else len(self.arguments)
+        if not required <= len(args) <= upper:
             expected_summary = (
-                ", ".join(a.name + ("?" if a.optional else "") for a in self.arguments)
+                ", ".join(
+                    a.name + ("..." if a.variadic else "?" if a.optional else "")
+                    for a in self.arguments
+                )
                 or "none"
             )
+            upper_txt = "∞" if has_variadic else str(len(self.arguments))
             raise CommandError(
-                f"{self.name}: expected {required}..{len(self.arguments)} "
+                f"{self.name}: expected {required}..{upper_txt} "
                 f"argument(s) ({expected_summary}); got {len(args)}"
             )
 
@@ -286,7 +306,7 @@ def _r_clean(_spec, client, _args, timeout):
     return client.request("@TG:24", timeout=timeout)
 
 
-def _r_decalc(_spec, client, _args, timeout):
+def _r_descale(_spec, client, _args, timeout):
     return client.request("@TG:25", timeout=timeout)
 
 
@@ -314,9 +334,295 @@ def _r_power_off(_spec, client, _args, timeout):
     return _request_or_disconnect(client, "@AN:02", timeout, "machine powering off")
 
 
+# CLI override alias -> recipe-parameter kind. Two tiers so the help
+# text (built from _BREW_KEY_ALIASES) doesn't leak the canonical kind
+# names as duplicate keys: friendly aliases first, then every canonical
+# kind maps to itself so the full name works too.
+_BREW_KEY_ALIASES = {
+    "water": profile.KIND_WATER_AMOUNT,
+    "ml": profile.KIND_WATER_AMOUNT,
+    "strength": profile.KIND_COFFEE_STRENGTH,
+    "temp": profile.KIND_TEMPERATURE,
+    "milk": profile.KIND_MILK_FOAM_AMOUNT,
+    "milk_foam": profile.KIND_MILK_FOAM_AMOUNT,
+}
+_BREW_KEY_TO_KIND = {
+    **_BREW_KEY_ALIASES,
+    **{kind: kind for kind in profile.RECIPE_PARAM_KINDS},
+}
+
+#: A full verbatim recipe blob is 16 bytes = 32 hex chars. Only treat
+#: input of at least this length as a raw blob, so short product names
+#: that happen to be all-hex ("dec", "feed", "face") stay names.
+_VERBATIM_BLOB_MIN_HEX = RECIPE_BLOB_BYTES * 2
+
+
 def _r_brew(_spec, client, args, timeout):
-    recipe = _ascii_arg("recipe", args[0])
+    """Start a product. Three input forms for ``<product>``:
+
+    * a product name from the machine profile (``espresso``,
+      ``hotwater`` — unambiguous prefixes OK) — requires a profile;
+    * a 2-hex product code (``0D``) — resolved against the profile;
+    * a full recipe blob (32+ hex chars) — sent verbatim, escape hatch
+      for firmware variants with a different layout.
+
+    Optional ``param=value`` args override the XML defaults, e.g.
+    ``water=220 strength=6 temp=high``. Values are validated against
+    the profile's catalogue before anything goes on the wire.
+    """
+    target = _ascii_arg("product", args[0])
+    overrides: dict[str, int | str] = {}
+    for raw in args[1:]:
+        key, sep, value = raw.partition("=")
+        if not sep or not value:
+            raise CommandError(
+                f"brew: expected param=value (e.g. water=220), got {raw!r}"
+            )
+        kind = _BREW_KEY_TO_KIND.get(key.strip().lower())
+        if kind is None:
+            known = ", ".join(sorted(_BREW_KEY_TO_KIND))
+            raise CommandError(f"brew: unknown parameter {key!r}. Known: {known}")
+        overrides[kind] = value.strip()
+
+    # A full recipe blob (>= 32 hex chars, even length) is trusted and
+    # sent verbatim. Shorter all-hex strings are product codes/names.
+    is_blob = (
+        bool(re.fullmatch(r"[0-9A-Fa-f]+", target))
+        and len(target) % 2 == 0
+        and len(target) >= _VERBATIM_BLOB_MIN_HEX
+    )
+    if is_blob:
+        if overrides:
+            raise CommandError(
+                "brew: param=value overrides cannot be combined with a "
+                "raw recipe blob — bake the values into the blob instead."
+            )
+        return client.request(f"@TP:{target}", timeout=timeout)
+    if client.profile is None:
+        raise CommandError(
+            "brew: product names and codes need a machine profile. Pair "
+            "with --machine-type <EF_code> (or pass --machine-type to "
+            "'command'); see 'jura-connect machine-types'. A full 32-hex "
+            "recipe blob is accepted without a profile as an escape hatch."
+        )
+    try:
+        definition = client.resolve_product(target)
+        recipe = definition.build_recipe_hex(overrides)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
     return client.request(f"@TP:{recipe}", timeout=timeout)
+
+
+# -- products discovery -------------------------------------------------
+
+#: Recipe kinds whose blob byte is NOT confirmed against real hardware.
+_NOT_LIVE_VERIFIED_KINDS = frozenset(
+    {
+        profile.KIND_BYPASS,
+        profile.KIND_MILK_FOAM_AMOUNT,
+        profile.KIND_MILK_BREAK,
+    }
+)
+_NOT_LIVE_VERIFIED_CAVEAT = "not live-verified — may misbrew, verify on your hardware"
+
+#: kind -> (unit label, wire-encoding note) for ranged parameters.
+_KIND_UNIT: dict[str, tuple[str, str]] = {
+    profile.KIND_WATER_AMOUNT: ("ml", "value ÷ 5 = 5 ml wire ticks"),
+    profile.KIND_BYPASS: ("ml", "value ÷ 5 = 5 ml wire ticks"),
+    profile.KIND_MILK_FOAM_AMOUNT: ("s", "seconds, sent as-is"),
+    profile.KIND_MILK_BREAK: ("s", "seconds, sent as-is"),
+}
+
+
+def _cli_keys_for_kind(kind: str) -> tuple[str, ...]:
+    """Every ``brew`` param=value key that maps to ``kind`` (short first)."""
+    keys = [k for k, v in _BREW_KEY_TO_KIND.items() if v == kind]
+    return tuple(sorted(keys, key=lambda k: (len(k), k)))
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ParamInfo:
+    """One brewable recipe parameter, described for a CLI user.
+
+    ``cli_keys`` are the ``brew <product> <key>=<value>`` keys that set
+    this parameter; ``settable`` is True exactly when it has at least
+    one such key. Some product params (e.g. ``milk_amount`` on the S8)
+    are reported by the machine XML but are NOT overridable via
+    ``brew`` — they carry no CLI key and are shown read-only under
+    their kind name. Enumerated params carry ``choices`` (``(name,
+    value_hex)`` in menu order); ranged params carry ``minimum`` /
+    ``maximum`` / ``step`` with a ``unit`` and ``encoding`` note.
+    ``live_verified`` is False for parameters whose wire byte has not
+    been confirmed on hardware (bypass / milk).
+    """
+
+    kind: str
+    cli_keys: tuple[str, ...]
+    settable: bool  # overridable via `brew` param=value (i.e. has a CLI key)
+    default: object  # int|None (ranged) or the default item name (enum)
+    default_hex: str | None
+    choices: tuple[tuple[str, str], ...]  # (name, value_hex), enum only
+    minimum: int | None
+    maximum: int | None
+    step: int | None
+    unit: str | None
+    encoding: str | None
+    live_verified: bool
+
+    def format(self) -> str:
+        # Never emit a blank key column: fall back to the kind name for
+        # params with no `brew` CLI alias.
+        label = " / ".join(self.cli_keys) if self.settable else self.kind
+        if self.choices:
+            choices = ", ".join(f"{name}={val}" for name, val in self.choices)
+            default = f"{self.default}" if self.default is not None else "-"
+            body = f"choices: {choices}"
+        else:
+            rng = f"{self.minimum}–{self.maximum}" if self.maximum is not None else "?"
+            step = f", step {self.step}" if self.step else ""
+            unit = f" {self.unit}" if self.unit else ""
+            enc = f" ({self.encoding})" if self.encoding else ""
+            default = f"{self.default}" if self.default is not None else "-"
+            body = f"range {rng}{unit}{step}{enc}"
+        if not self.settable:
+            annot = "  (read-only: not settable via 'brew')"
+        elif not self.live_verified:
+            annot = f"  [{_NOT_LIVE_VERIFIED_CAVEAT}]"
+        else:
+            annot = ""
+        return f"    {label:<28} default {default:<8} {body}{annot}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "cli_keys": list(self.cli_keys),
+            "settable": self.settable,
+            "default": self.default,
+            "default_hex": self.default_hex,
+            "choices": [{"name": n, "value": v} for n, v in self.choices],
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "step": self.step,
+            "unit": self.unit,
+            "encoding": self.encoding,
+            "live_verified": self.live_verified,
+        }
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductInfo:
+    """One brewable product and its recipe parameters."""
+
+    code: int
+    name: str  # resolvable snake_case name (what ``brew <name>`` accepts)
+    raw_name: str
+    params: tuple[ParamInfo, ...]
+
+    def format(self) -> str:
+        head = f"{self.name}  (0x{self.code:02X})"
+        if not self.params:
+            return head + "\n    (no adjustable parameters)"
+        return "\n".join([head, *(p.format() for p in self.params)])
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": f"{self.code:02X}",
+            "name": self.name,
+            "raw_name": self.raw_name,
+            "params": [p.to_dict() for p in self.params],
+        }
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductCatalogue:
+    """Brewable products of a machine, with allowed parameter values.
+
+    Built from the loaded :class:`~jura_connect.profile.MachineProfile`
+    — the same source :meth:`~jura_connect.client.JuraClient.brew` and
+    ``resolve_product`` use — so ``name`` is exactly what
+    ``brew <name>`` accepts. Only active (brewable) products are listed.
+    """
+
+    machine_code: str
+    products: tuple[ProductInfo, ...]
+
+    def format(self) -> str:
+        header = f"{self.machine_code} — {len(self.products)} brewable product(s)"
+        blocks = [p.format() for p in self.products]
+        return "\n\n".join([header, *blocks])
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "machine_code": self.machine_code,
+            "products": [p.to_dict() for p in self.products],
+        }
+
+
+def _param_info(param) -> ParamInfo:
+    kind = param.kind
+    cli_keys = _cli_keys_for_kind(kind)
+    # A param is overridable via `brew` only when it has a CLI key. Some
+    # machine-reported params (e.g. milk_amount on the S8) have none.
+    settable = bool(cli_keys)
+    live = kind not in _NOT_LIVE_VERIFIED_KINDS
+    unit, encoding = _KIND_UNIT.get(kind, (None, None))
+    if param.items:  # enumerated (strength / temperature)
+        choices = tuple((it.name, it.value) for it in param.items)
+        default_name: str | None = None
+        default_hex: str | None = None
+        if param.default is not None:
+            default_hex = f"{param.default:02X}"
+            match = next((it for it in param.items if it.value == default_hex), None)
+            default_name = match.name if match is not None else default_hex
+        return ParamInfo(
+            kind=kind,
+            cli_keys=cli_keys,
+            settable=settable,
+            default=default_name,
+            default_hex=default_hex,
+            choices=choices,
+            minimum=None,
+            maximum=None,
+            step=None,
+            unit=None,
+            encoding=None,
+            live_verified=live,
+        )
+    return ParamInfo(
+        kind=kind,
+        cli_keys=cli_keys,
+        settable=settable,
+        default=param.default,
+        default_hex=None,
+        choices=(),
+        minimum=param.minimum,
+        maximum=param.maximum,
+        step=param.step,
+        unit=unit,
+        encoding=encoding,
+        live_verified=live,
+    )
+
+
+def _r_products(_spec, client, _args, _timeout):
+    prof = client.profile
+    if prof is None:
+        raise CommandError(
+            "products: needs a machine profile. Pair with "
+            "--machine-type <EF_code> (or pass --machine-type to "
+            "'command'); see 'jura-connect machine-types'."
+        )
+    products = tuple(
+        ProductInfo(
+            code=p.code,
+            name=p.name,
+            raw_name=p.raw_name,
+            params=tuple(_param_info(pp) for pp in p.params),
+        )
+        for p in prof.products
+        if p.active
+    )
+    return ProductCatalogue(machine_code=prof.code, products=products)
 
 
 def _r_set_pin(_spec, client, args, timeout):
@@ -473,6 +779,15 @@ _SPECS: tuple[CommandSpec, ...] = (
         runner=_r_brews,
     ),
     CommandSpec(
+        name="products",
+        description=(
+            "list brewable products and their allowed 'brew' param=value "
+            "ranges/choices (from the machine profile; no machine I/O)"
+        ),
+        arguments=(),
+        runner=_r_products,
+    ),
+    CommandSpec(
         name="pmode",
         description="programmable-mode slots (@TM:50 + @TM:42); empty on the S8 EB",
         arguments=(),
@@ -549,10 +864,10 @@ _SPECS: tuple[CommandSpec, ...] = (
         ),
     ),
     CommandSpec(
-        name="decalc",
+        name="descale",
         description="[destructive] start descaling cycle (@TG:25)",
         arguments=(),
-        runner=_r_decalc,
+        runner=_r_descale,
         destructive=True,
         danger=(
             "starts a real descaling cycle (30+ min). The machine expects "
@@ -602,7 +917,7 @@ _SPECS: tuple[CommandSpec, ...] = (
         destructive=True,
         danger=(
             "irreversibly resets every maintenance counter (cleaning / "
-            "decalc / filter / etc.) to zero. The machine will then "
+            "descale / filter / etc.) to zero. The machine will then "
             "'forget' when it was last serviced. There is no undo."
         ),
     ),
@@ -637,17 +952,35 @@ _SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="brew",
-        description="[destructive] start brewing a recipe (@TP:<recipe>)",
+        description=(
+            "[destructive] start brewing a product (@TP:<recipe blob>); "
+            "run 'products' to discover valid names and param=value ranges"
+        ),
         arguments=(
-            Argument("recipe", "product code, e.g. 01 (espresso). Firmware-specific."),
+            Argument(
+                "product",
+                "profile product name ('espresso', 'hotwater'…; prefix "
+                "OK), 2-hex product code, or a full recipe blob (32+ hex). "
+                "Run 'products' to list valid names",
+            ),
+            Argument(
+                "param=value",
+                "recipe override(s): water=<ml> strength=<level> "
+                "temp=<low|normal|high> milk=<s> milk_break=<s> "
+                "bypass=<ml>; defaults come from the machine XML. Run "
+                "'products' for each product's allowed values",
+                optional=True,
+                variadic=True,
+            ),
         ),
         runner=_r_brew,
         destructive=True,
         danger=(
-            "immediately starts brewing the given product recipe. The "
-            "machine will draw water, run the grinder, and dispense at the "
-            "spout — make sure a suitable cup is in place. Wrong recipe "
-            "codes can waste beans, water, or steam."
+            "immediately starts brewing the given product. The machine "
+            "will draw water, run the grinder, and dispense at the "
+            "spout — make sure a suitable cup is in place; there is no "
+            "remote abort. Quantities are validated against the machine "
+            "XML, but a wrong product still wastes beans, water, or milk."
         ),
     ),
     CommandSpec(

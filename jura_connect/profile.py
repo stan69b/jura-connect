@@ -53,13 +53,42 @@ class AlertDef:
     raw_name: str  # the original XML Name (with spaces)
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
-class ProductDef:
-    """One PRODUCT entry from the machine XML."""
+def _snake(name: str) -> str:
+    """Normalise an XML ``Name`` attribute to a snake_case identifier.
 
-    code: int  # product code, e.g. 0x02
-    name: str  # snake_case, e.g. "espresso"
-    raw_name: str  # original XML Name
+    Splits CamelCase ("AutoOFF" → "auto_off",
+    "DisplayBrightnessSetting" → "display_brightness_setting") and
+    flattens runs of non-alphanumerics to single underscores.
+    """
+    s = name.strip()
+    # Split lower→upper boundaries: "fooBar" → "foo Bar"
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
+    # Split runs of uppercase followed by a lowercase letter:
+    # "HTMLParser" → "HTML Parser", "AutoOFFTimer" → "Auto OFF Timer".
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = s.strip("_")
+    return s or "unnamed"
+
+
+def _validate_ranged(
+    value: int, lo: int | None, hi: int | None, step: int | None, name: str
+) -> None:
+    """Validate an integer against an XML Min/Max/Step range.
+
+    Shared by :meth:`ProductParam.encode` and
+    :meth:`SettingDef.normalise_value`. When ``Min`` is absent in the
+    XML it defaults to ``0`` — never to "unbounded" — so an off-step or
+    out-of-range water amount can't slip through a profile that happens
+    to omit ``Min``. Raises :class:`ValueError` on any violation.
+    """
+    lo = 0 if lo is None else lo
+    hi = 0xFF if hi is None else hi
+    if not lo <= value <= hi:
+        raise ValueError(f"{name}: {value} is outside [{lo}, {hi}]")
+    if step and step > 1 and (value - lo) % step != 0:
+        raise ValueError(f"{name}: {value} is not aligned to the step ({step})")
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -192,16 +221,7 @@ class SettingDef:
                 raise ValueError(
                     f"{self.raw_name}: expected an integer, got {raw!r}"
                 ) from exc
-            lo = self.minimum if self.minimum is not None else 0
-            hi = self.maximum if self.maximum is not None else 0xFF
-            if not lo <= n <= hi:
-                raise ValueError(f"{self.raw_name}: {n} is outside [{lo}, {hi}]")
-            if self.step and self.step > 1 and (n - lo) % self.step != 0:
-                raise ValueError(
-                    f"{self.raw_name}: {n} is not aligned to the step "
-                    f"({self.step}); allowed values are "
-                    f"{lo}, {lo + self.step}, {lo + 2 * self.step}, …, {hi}"
-                )
+            _validate_ranged(n, self.minimum, self.maximum, self.step, self.raw_name)
             width = len(self.mask) if self.mask else 2
             return f"{n:0{width}X}"
         # SWITCH / COMBOBOX / ItemSlider — match against ITEM names or
@@ -219,6 +239,240 @@ class SettingDef:
             f"{self.raw_name}: {raw!r} is not a recognised value. "
             f"Allowed: {allowed or '(no options known)'}"
         )
+
+
+#: Total length of the ``@TP:`` recipe blob in bytes. Live-verified by
+#: physically brewing on a JURA S8 EB (EF1091) and, independently, an
+#: E6: the machine ACKs and brews a 16-byte payload whose *unused*
+#: bytes are ``0x00`` (see :meth:`ProductDef.build_recipe_hex`); a
+#: bare product code, or an FF-padded blob, is ACKed ``@tp:00`` and
+#: silently ignored.
+RECIPE_BLOB_BYTES = 16
+
+#: Blob byte index that must always be ``0x01`` for the machine to
+#: accept and brew the recipe. Observed constant across every
+#: hardware-verified vector (S8 EB cafe_barista, E6 espresso, E6
+#: coffee); no bundled product carries a parameter at this index
+#: (nothing uses ``Argument="F9"``), so it is a fixed structural byte.
+_RECIPE_VALID_BYTE_INDEX = 8
+_RECIPE_VALID_BYTE = "01"
+
+#: Recipe-parameter kinds whose XML values are millilitres encoded on
+#: the wire as 5 ml ticks (one byte). WATER_AMOUNT is live-verified on
+#: the S8 EB (EF1091): water at 45 ml lands as 0x09 (9 ticks). BYPASS
+#: shares WATER_AMOUNT's ml semantics in the XML (ml-ranged, Step=5)
+#: and is live-verified on the S8 EB (cafe_barista bypass 45 ml -> 0x09).
+_ML_TICK_KINDS = frozenset({"water_amount", "bypass"})
+
+#: 5 ml per wire tick for the kinds above (matches the Bluetooth
+#: protocol's "1 second = 5 ml" documented by Jutta-Proto).
+_ML_PER_TICK = 5
+
+# --- Public recipe-parameter kind identifiers --------------------------
+# These are the stable snake_case strings used as :attr:`ProductParam.kind`
+# and as the keys of the ``overrides`` dict accepted by
+# :meth:`ProductDef.build_recipe_hex`. Downstream consumers (the Home
+# Assistant component) should import these instead of hard-coding the
+# literal strings, so a future rename stays in one place.
+KIND_WATER_AMOUNT = "water_amount"
+KIND_COFFEE_STRENGTH = "coffee_strength"
+KIND_TEMPERATURE = "temperature"
+KIND_MILK_FOAM_AMOUNT = "milk_foam_amount"
+KIND_MILK_BREAK = "milk_break"
+KIND_BYPASS = "bypass"
+
+#: All recipe-parameter kinds this library knows how to encode, in a
+#: stable order suitable for building UI (product code first is implicit).
+RECIPE_PARAM_KINDS: tuple[str, ...] = (
+    KIND_COFFEE_STRENGTH,
+    KIND_WATER_AMOUNT,
+    KIND_TEMPERATURE,
+    KIND_MILK_FOAM_AMOUNT,
+    KIND_MILK_BREAK,
+    KIND_BYPASS,
+)
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductParam:
+    """One recipe parameter of a PRODUCT entry (WATER_AMOUNT, …).
+
+    Public/stable attributes (UI-render contract): :attr:`kind` (stable
+    identifier — compare against the ``KIND_*`` constants),
+    :attr:`default` (XML default in XML units, or ``None``),
+    :attr:`minimum` / :attr:`maximum` / :attr:`step` (ranged/ml params),
+    and :attr:`items` (ordered choices for enumerated params such as
+    strength/temperature; each has ``.name``, ``.raw_name``, ``.value``).
+
+    ``argument`` is the XML ``Argument`` attribute's F-number
+    (``Argument="F4"`` → 4). The F-numbers are byte positions in the
+    Bluetooth start-product command *including* its leading key byte;
+    the WiFi ``@TP:`` blob carries no key byte, so the byte offset
+    inside the blob is ``argument - 1`` (:attr:`offset`). Verified
+    live on an E8 (EB) / EF538 — water at F4 lands on blob byte 3.
+    """
+
+    kind: str  # snake_case XML tag, e.g. "water_amount"
+    argument: int  # F-number from the XML, e.g. 4 for Argument="F4"
+    default: int | None  # XML Value/Default in XML units (ml / level / s)
+    minimum: int | None
+    maximum: int | None
+    step: int | None
+    items: tuple[SettingItem, ...]  # TEMPERATURE only
+
+    @property
+    def offset(self) -> int:
+        """Byte offset of this parameter inside the recipe blob."""
+        return self.argument - 1
+
+    def encode(self, value: int | str) -> int:
+        """Validate ``value`` (in XML units) and return the wire byte.
+
+        * ml-ranged kinds (water, bypass): validated against Min/Max/
+          Step, then divided into 5 ml ticks;
+        * ITEM-driven kinds (temperature): accepts an ITEM name
+          (``"normal"``) or a hex value from the catalogue (``"01"``);
+        * everything else (strength level, milk seconds): validated
+          against Min/Max/Step and sent as-is.
+        """
+        if self.items:
+            if isinstance(value, str):
+                item = next((it for it in self.items if it.name == _snake(value)), None)
+                if item is None:
+                    # Allow the raw catalogue hex too ("01").
+                    candidate = value.strip().upper()
+                    item = next(
+                        (it for it in self.items if it.value == candidate), None
+                    )
+                if item is None:
+                    allowed = ", ".join(f"{it.name}={it.value}" for it in self.items)
+                    raise ValueError(
+                        f"{self.kind}: {value!r} is not a recognised value. "
+                        f"Allowed: {allowed}"
+                    )
+                return int(item.value, 16)
+            if not any(int(it.value, 16) == value for it in self.items):
+                allowed = ", ".join(f"{it.name}={it.value}" for it in self.items)
+                raise ValueError(
+                    f"{self.kind}: {value} is not in the catalogue. Allowed: {allowed}"
+                )
+            return value
+        if isinstance(value, str):
+            try:
+                value = int(value, 10)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{self.kind}: expected an integer, got {value!r}"
+                ) from exc
+        _validate_ranged(value, self.minimum, self.maximum, self.step, self.kind)
+        wire = value // _ML_PER_TICK if self.kind in _ML_TICK_KINDS else value
+        if not 0 <= wire <= 0xFF:  # single unsigned byte
+            raise ValueError(f"{self.kind}: {value} does not fit the wire byte")
+        return wire
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductDef:
+    """One PRODUCT entry from the machine XML.
+
+    Public/stable attributes for building UI: :attr:`code` (int product
+    code), :attr:`name` (snake_case), :attr:`raw_name` (original XML
+    label), :attr:`active` (whether to offer it as brewable),
+    :attr:`params` (iterable of :class:`ProductParam`), and the
+    :meth:`param` lookup. :meth:`build_recipe_hex` turns a chosen recipe
+    into the wire blob.
+    """
+
+    code: int  # product code, e.g. 0x02
+    name: str  # snake_case, e.g. "espresso"
+    raw_name: str  # original XML Name
+    params: tuple[ProductParam, ...] = ()  # recipe parameters, may be empty
+    # Whether J.O.E. shows this product in the brew menu. Defaults to
+    # True (XMLParser.java sets Active true unless the XML says
+    # Active="false"). Products flagged inactive — the internal
+    # Powderproduct, and the double-shot slots on some models — are kept
+    # in the catalogue (the machine still reports counters for them) but
+    # a UI should not offer them as brewable.
+    active: bool = True
+
+    def param(self, kind: str) -> ProductParam | None:
+        """Find a recipe parameter by kind (e.g. ``"water_amount"``)."""
+        for p in self.params:
+            if p.kind == kind:
+                return p
+        return None
+
+    def build_recipe_hex(self, overrides: dict[str, int | str] | None = None) -> str:
+        """Build the 16-byte ``@TP:`` recipe blob for this product.
+
+        Blob layout — **live-verified by physically brewing** on a JURA
+        S8 EB (EF1091) and, independently, an E6:
+
+        * byte 0 — the product code;
+        * byte ``F-1`` for every XML parameter (strength at F3 → byte 2,
+          water at F4 → byte 3 in 5 ml ticks, milk foam at F6 → byte 5
+          in seconds, temperature at F7 → byte 6 as 00/01/02, bypass at
+          F10 → byte 9 in 5 ml ticks, milk break at F11 → byte 10);
+        * **byte 8 → ``0x01``** always (a fixed structural / "recipe
+          valid" byte; no bundled product uses ``F9``);
+        * **``0x00`` everywhere else** ("parameter not set").
+
+        The earlier FF-padded layout was never physically brewed and is
+        wrong: the machine ACKs an FF-padded blob with ``@tp:00`` and
+        silently does nothing (no ``@TB`` / ``@TV`` frames, counters
+        unchanged). The 00-padded, byte-8=01 form brews on the first
+        send. See PROTOCOL.md §5.9.
+
+        ``overrides`` maps parameter kinds to values in XML units,
+        e.g. ``{"water_amount": 220, "temperature": "high"}``. Use the
+        ``KIND_*`` constants for the keys. Parameters not overridden
+        fall back to the XML default. Values are validated against the
+        XML catalogue *before* anything goes on the wire.
+
+        **Not live-verified — may misbrew, verify on your hardware:**
+        the ``milk_foam_amount`` / ``milk_break`` encodings are inferred
+        from the XML (seconds, sent as-is), not individually confirmed.
+        Water, temperature, strength and bypass are live-verified on the
+        S8 EB.
+
+        Raises :class:`ValueError` on unknown override kinds, on
+        out-of-range values, and when a millilitre parameter the product
+        *has* would be left unset (no override and no XML default):
+        with 00-padding that byte would be ``0x00`` = **no water**, so
+        rather than silently brew a dry/short shot this is refused —
+        pass an explicit amount.
+        """
+        overrides = dict(overrides or {})
+        blob = ["00"] * RECIPE_BLOB_BYTES
+        blob[0] = f"{self.code:02X}"
+        # Fixed structural byte required for the machine to brew; set
+        # before the param loop so a (hypothetical, currently
+        # non-existent) F9 param would take precedence rather than be
+        # clobbered.
+        blob[_RECIPE_VALID_BYTE_INDEX] = _RECIPE_VALID_BYTE
+        for p in self.params:
+            if not 0 < p.offset < RECIPE_BLOB_BYTES:
+                raise ValueError(
+                    f"{self.name}: parameter {p.kind} has offset {p.offset} "
+                    f"outside the {RECIPE_BLOB_BYTES}-byte recipe blob"
+                )
+            value = overrides.pop(p.kind, p.default)
+            if value is None:
+                if p.kind in _ML_TICK_KINDS:
+                    raise ValueError(
+                        f"{self.name}: water-amount parameter {p.kind!r} has no "
+                        f"value and no XML default; refusing to leave its byte at "
+                        f"0x00 (= no water). Pass an explicit amount."
+                    )
+                continue
+            blob[p.offset] = f"{p.encode(value):02X}"
+        if overrides:
+            known = ", ".join(p.kind for p in self.params) or "(none)"
+            raise ValueError(
+                f"{self.name}: unknown recipe parameter(s) "
+                f"{', '.join(sorted(overrides))}. This product accepts: {known}"
+            )
+        return "".join(blob)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -270,25 +524,6 @@ class MachineProfile:
 # --------------------------------------------------------------------- #
 
 
-def _snake(name: str) -> str:
-    """Normalise an XML ``Name`` attribute to a snake_case identifier.
-
-    Splits CamelCase ("AutoOFF" → "auto_off",
-    "DisplayBrightnessSetting" → "display_brightness_setting") and
-    flattens runs of non-alphanumerics to single underscores.
-    """
-    s = name.strip()
-    # Split lower→upper boundaries: "fooBar" → "foo Bar"
-    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
-    # Split runs of uppercase followed by a lowercase letter:
-    # "HTMLParser" → "HTML Parser", "AutoOFFTimer" → "Auto OFF Timer".
-    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = s.strip("_")
-    return s or "unnamed"
-
-
 def _parse_xml(text: str, code: str, version: str) -> MachineProfile:
     """Parse a single machine XML into a :class:`MachineProfile`."""
     root = ET.fromstring(text)
@@ -305,10 +540,13 @@ def _parse_xml(text: str, code: str, version: str) -> MachineProfile:
             continue
         xml_type = alert.get("Type")
         severity = _XML_TYPE_TO_SEVERITY.get(xml_type or "", "info")
+        # The Jura XMLs spell the descaling alert "decalc alert"; expose
+        # it under the consistent "descale" key the rest of the API uses.
+        name = _snake(raw_name).replace("decalc", "descale")
         alerts.append(
             AlertDef(
                 bit=bit,
-                name=_snake(raw_name),
+                name=name,
                 severity=severity,
                 raw_name=raw_name,
             )
@@ -330,11 +568,20 @@ def _parse_xml(text: str, code: str, version: str) -> MachineProfile:
             # which matches J.O.E.'s parsing order.
             continue
         seen_codes.add(code_int)
+        # J.O.E. (XMLParser.java) defaults the Active flag to true and
+        # only hides products explicitly marked Active="false". Products
+        # with no Active attribute — Milk Foam, Cafe Barista, Barista
+        # Lungo, and dozens of other models' menu items — stay brewable.
+        # Inactive products are kept in the catalogue (the machine still
+        # reports their counters) but flagged so a UI can hide them.
+        active = (product.get("Active") or "").strip().lower() != "false"
         products.append(
             ProductDef(
                 code=code_int,
                 name=_snake(raw_name),
                 raw_name=raw_name,
+                params=_parse_product_params(product),
+                active=active,
             )
         )
 
@@ -350,6 +597,72 @@ def _parse_xml(text: str, code: str, version: str) -> MachineProfile:
         settings=settings,
         has_pmode=has_pmode,
     )
+
+
+def _int_attr(el: ET.Element, name: str) -> int | None:
+    """Read a decimal integer XML attribute, or ``None`` if absent/bad."""
+    raw = el.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _parse_product_params(product: ET.Element) -> tuple[ProductParam, ...]:
+    """Parse a PRODUCT element's recipe parameters.
+
+    Every direct child carrying an ``Argument="F<n>"`` attribute is a
+    recipe parameter (WATER_AMOUNT, COFFEE_STRENGTH, TEMPERATURE,
+    MILK_FOAM_AMOUNT, BYPASS, MILK_BREAK, …). Children without an
+    F-numbered Argument (e.g. PRESELECTION) are skipped.
+    """
+    params: list[ProductParam] = []
+    for el in product:
+        arg = el.get("Argument") or ""
+        if not arg.startswith("F"):
+            continue
+        try:
+            argument = int(arg[1:])
+        except ValueError:
+            continue
+        tag = el.tag.split("}", 1)[-1]
+        items: list[SettingItem] = []
+        for item in el.findall("{*}ITEM"):
+            iname = item.get("Name") or ""
+            ivalue = item.get("Value") or ""
+            if not iname or not ivalue:
+                continue
+            items.append(
+                SettingItem(name=_snake(iname), raw_name=iname, value=ivalue.upper())
+            )
+        # Defaults: ranged parameters carry Value (XML units, decimal);
+        # ITEM-driven parameters (TEMPERATURE) carry Default (hex,
+        # matching an ITEM Value).
+        default: int | None = None
+        raw_value = el.get("Value")
+        raw_default = el.get("Default")
+        try:
+            if raw_value is not None:
+                default = int(raw_value)
+            elif raw_default is not None:
+                default = int(raw_default, 16)
+        except ValueError:
+            default = None
+
+        params.append(
+            ProductParam(
+                kind=_snake(tag),
+                argument=argument,
+                default=default,
+                minimum=_int_attr(el, "Min"),
+                maximum=_int_attr(el, "Max"),
+                step=_int_attr(el, "Step"),
+                items=tuple(items),
+            )
+        )
+    return tuple(params)
 
 
 # Map XML element tag (local-name) and SliderType attribute -> kind.
