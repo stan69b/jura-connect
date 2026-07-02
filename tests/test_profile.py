@@ -119,21 +119,28 @@ def test_ef538_product_params_parsed_from_xml():
     assert hot_water.param("preselection") is None
 
 
-def test_build_recipe_hex_matches_live_verified_blob():
-    """Live-verified on an E8 (EB): this exact blob dispensed 220 ml."""
+def test_build_recipe_hex_uses_00_padding_and_byte8_flag():
+    """The hardware-verified layout is 00-padded with byte 8 = 0x01.
+
+    Water at 220 ml -> 0x2C (44 ticks) at byte 3, temperature normal
+    (default) -> 0x01 at byte 6, byte 8 = 0x01, everything else 0x00."""
     p = load_profile("EF538")
     hot_water = p.product_by_code[0x0D]
     assert (
         hot_water.build_recipe_hex({"water_amount": 220})
-        == "0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF"
+        == "0D00002C000001000100000000000000"
     )
     # XML defaults only — same blob, since 220 ml is the XML default.
-    assert hot_water.build_recipe_hex() == "0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF"
+    assert hot_water.build_recipe_hex() == "0D00002C000001000100000000000000"
     # Temperature accepts ITEM names and lands on byte 6.
     assert (
         hot_water.build_recipe_hex({"temperature": "high"})
-        == "0DFFFF2CFFFF02FFFFFFFFFFFFFFFFFF"
+        == "0D00002C000002000100000000000000"
     )
+    # Padding is 0x00 and byte 8 is the constant 0x01.
+    blob = hot_water.build_recipe_hex()
+    assert blob[1 * 2 : 1 * 2 + 2] == "00"  # unused byte
+    assert blob[8 * 2 : 8 * 2 + 2] == "01"  # structural "recipe valid" byte
 
 
 def test_build_recipe_hex_validates_against_catalogue():
@@ -171,7 +178,8 @@ def test_active_default_true_keeps_products_without_active_attribute():
 
 def test_build_recipe_hex_flood_guard_on_missing_ml_value():
     """A water/ml parameter with no override and no XML default must be
-    refused, never left at FF (=255 ticks ≈ 1.3 l flood)."""
+    refused: with 00-padding its byte would be 0x00 (= no water), so
+    rather than silently brew a dry shot the builder raises."""
     from jura_connect.profile import ProductDef, ProductParam
 
     # Synthetic product with a WATER_AMOUNT param that has NO default.
@@ -232,18 +240,11 @@ def test_build_recipe_hex_encodes_bypass_and_milk_foam_defaults():
     assert milk_foam.build_recipe_hex()[5 * 2 : 5 * 2 + 2] == "16"
 
 
-def test_build_recipe_hex_byte_math_matches_e6_style_layout():
-    """The E6-family live vectors use a 00-padded layout with a byte-8
-    flag that this FF-fill builder does not emit; assert the *byte math*
-    (offsets F-1, water ÷5 ticks, temperature ITEM values) that the
-    builder does guarantee, via a synthetic ProductDef.
-
-    NOTE: the two hardware vectors 02000809000002000100000000000000
-    (Espresso) and 0300021A000001000100000000000000 (Coffee, str 2,
-    130 ml, Normal) are 00-padded and set byte 8 = 01, which differs
-    from the FF-padded EF538/E8 blob this library builds. They are a
-    firmware-family variation to be verified on hardware; only the
-    positions/scaling below are asserted here."""
+def test_build_recipe_hex_matches_e6_live_verified_coffee_vector():
+    """The builder now reproduces the E6 author's hardware-verified
+    Coffee vector exactly: 0300021A000001000100000000000000 (strength
+    2, 130 ml, Normal). 00-padded, byte 8 = 01, params at F-1 offsets
+    (strength@2, water 130ml/5=0x1A@3, temperature Normal=01@6)."""
     from jura_connect.profile import ProductDef, ProductParam, SettingItem
 
     strength = ProductParam(
@@ -288,12 +289,39 @@ def test_build_recipe_hex_byte_math_matches_e6_style_layout():
     blob = coffee.build_recipe_hex(
         {"coffee_strength": 2, "water_amount": 130, "temperature": "normal"}
     )
-    # Product code at byte 0, strength at F3->byte2, water 130ml/5=26=1A
-    # at F4->byte3, temperature Normal=01 at F7->byte6.
-    assert blob[0:2] == "03"
-    assert blob[2 * 2 : 2 * 2 + 2] == "02"
-    assert blob[3 * 2 : 3 * 2 + 2] == "1A"
-    assert blob[6 * 2 : 6 * 2 + 2] == "01"
+    assert blob == "0300021A000001000100000000000000"
+
+
+def test_build_recipe_hex_matches_s8eb_live_verified_cafe_barista():
+    """Owner's machine (JURA S8 EB / EF1091, 'kaffeebert') physically
+    brewed this exact blob on the first send: cafe_barista (0x28),
+    strength 7 (byte2=07), water 45 ml -> 0x09 (byte3), temperature
+    normal -> 0x01 (byte6), byte8=01, bypass 45 ml -> 0x09 (byte9),
+    everything else 0x00."""
+    p = load_profile("EF1091")
+    cafe_barista = p.product_by_code[0x28]
+    blob = cafe_barista.build_recipe_hex(
+        {
+            "coffee_strength": 7,
+            "water_amount": 45,
+            "temperature": "normal",
+            "bypass": 45,
+        }
+    )
+    assert blob == "28000709000001000109000000000000"
+    # Unused bytes are 0x00 (not 0xFF) and byte 8 is the constant 0x01.
+    assert blob[1 * 2 : 1 * 2 + 2] == "00"
+    assert blob[7 * 2 : 7 * 2 + 2] == "00"
+    assert blob[8 * 2 : 8 * 2 + 2] == "01"
+    assert blob.endswith("000000000000")
+
+
+def test_build_recipe_hex_matches_e6_live_verified_espresso_vector():
+    """The EF538 Espresso defaults reproduce the E6 author's second
+    hardware-verified vector: 02000809000002000100000000000000."""
+    p = load_profile("EF538")
+    espresso = p.product_by_code[0x02]
+    assert espresso.build_recipe_hex() == "02000809000002000100000000000000"
 
 
 def test_parse_xml_handles_default_namespace():

@@ -87,6 +87,9 @@ expressed in the simulator (rare), either extend the simulator
 itself, or write a tiny one-shot socket server inline in the test
 (see `test_handshake.py::test_handshake_error_on_garbage_reply`).
 
+The maintainer uses a JURA S8 EB (EF1091); unless stated otherwise,
+assume this machine type is available and used for hardware testing.
+
 ## 4. Library does the work; CLI is a thin shell
 
 * Structured data and its presentation live together. Every result

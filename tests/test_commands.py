@@ -426,7 +426,7 @@ _DESTRUCTIVE_INVOCATIONS = [
     ("restart", []),
     ("power-off", []),
     # A full 32-hex @TP: blob reaches the wire without a profile.
-    ("brew", ["0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF"]),
+    ("brew", ["28000709000001000109000000000000"]),
     ("set-pin", ["1234"]),
     ("set-ssid", ["mywifi"]),
     ("set-password", ["s3cret"]),
@@ -525,7 +525,7 @@ def test_brew_full_blob_passthrough(sim) -> None:
         result = run_named(
             c,
             "brew",
-            ["0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF"],
+            ["28000709000001000109000000000000"],
             timeout=2.0,
             allow_destructive=True,
         )
@@ -574,7 +574,7 @@ def test_brew_validates_overrides_before_wire(sim) -> None:
             run_named(
                 c,
                 "brew",
-                ["0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF", "water=220"],
+                ["28000709000001000109000000000000", "water=220"],
                 timeout=1.0,
                 allow_destructive=True,
             )
@@ -632,6 +632,18 @@ def test_brew_variadic_overrides_uncapped(sim) -> None:
         result  # noqa: B018
     finally:
         c.close()
+
+
+def test_brew_accept_semantics_tp_vs_tp00() -> None:
+    """The machine returns bare `@tp` on accept but `@tp:00` when it
+    rejects/ignores the blob (e.g. the old FF-padded layout). `@tp:00`
+    must NOT count as accepted."""
+    from jura_connect.client import _is_brew_accept
+
+    assert _is_brew_accept("@tp") is True
+    assert _is_brew_accept("@TP") is True
+    assert _is_brew_accept("@tp:00") is False
+    assert _is_brew_accept("@an:error") is False
 
 
 def test_brew_short_hex_name_is_not_a_verbatim_blob(sim) -> None:

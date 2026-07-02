@@ -94,6 +94,18 @@ def _capped_join(items: list[str], limit: int = 10) -> str:
     return ", ".join(items[:limit]) + f", … (+{len(items) - limit} more)"
 
 
+def _is_brew_accept(reply: str) -> bool:
+    """True when a ``@TP:`` reply means the machine accepted the brew.
+
+    The machine returns a bare ``@tp`` on accept, but ``@tp:00`` when it
+    rejects / silently ignores the blob (e.g. the old FF-padded layout,
+    or a bare product code). ``@tp:00`` must NOT be treated as success —
+    live-verified on the S8 EB (EF1091).
+    """
+    r = reply.strip().lower()
+    return r.startswith("@tp") and not r.startswith("@tp:00")
+
+
 def _classify(reply: str) -> HandshakeResult:
     m = _HP_RE.match(reply.strip())
     if not m:
@@ -865,7 +877,7 @@ class JuraClient:
                 overrides[kind] = value
         recipe = definition.build_recipe_hex(overrides)
         reply = self.request(f"@TP:{recipe}", timeout=timeout)
-        if retry and not reply.lower().startswith("@tp"):
+        if retry and not _is_brew_accept(reply):
             # Energy-safe wake-up: the first @TP: only woke the machine;
             # resend now that it is awake.
             reply = self.request(f"@TP:{recipe}", timeout=timeout)

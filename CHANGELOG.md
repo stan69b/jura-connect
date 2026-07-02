@@ -18,17 +18,28 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Brewing actually brews now.** ``brew`` used to send the bare
-  product code (``@TP:0D``) as the Bluetooth-era docs suggest.
-  TT237W-family WiFi firmware ACKs that with ``@tp`` and then
-  silently does nothing — the same ACK-but-ignore trap as the
-  unwrapped ``@TM:`` writes fixed in v0.9.2. Verified live on an
-  E8 (EB) / EF538: the firmware executes a **16-byte recipe blob**
-  with the product code at byte 0 and every recipe parameter at the
-  byte offset given by its machine-XML ``Argument`` F-number minus
-  one (the F-numbers count the Bluetooth command's leading key byte,
-  which the WiFi blob doesn't carry). Water travels as 5 ml ticks;
-  an unset water byte means 255 ticks ≈ 1.275 litres, so the blob is
-  always sent in full. See §5.9 of ``docs/PROTOCOL.md``.
+  product code (``@TP:0D``) as the Bluetooth-era docs suggest. The
+  WiFi firmware ACKs that with ``@tp:00`` and then silently does
+  nothing — the same ACK-but-ignore trap as the unwrapped ``@TM:``
+  writes fixed in v0.9.2. The firmware executes a **16-byte recipe
+  blob** with the product code at byte 0 and every recipe parameter
+  at the byte offset given by its machine-XML ``Argument`` F-number
+  minus one (the F-numbers count the Bluetooth command's leading key
+  byte, which the WiFi blob doesn't carry). See §5.9 of
+  ``docs/PROTOCOL.md``.
+- **Corrected the recipe-blob layout — now hardware-verified.** The
+  blob is **0x00-padded** (not 0xFF) and **byte 8 is a constant
+  0x01**; an FF-padded blob is ACKed ``@tp:00`` and silently ignored.
+  Confirmed by physically brewing on a JURA S8 EB (EF1091) —
+  ``cafe_barista`` strength 7 / 45 ml / normal / bypass 45 ml →
+  ``@TP:28000709000001000109000000000000`` brewed on the first send —
+  and matching the E6 author's two live-verified vectors
+  (``02000809000002000100000000000000``,
+  ``0300021A000001000100000000000000``). Water and bypass travel as
+  5 ml ticks; with 0x00 padding an unset water byte is ``0x00`` = no
+  water, so ``build_recipe_hex`` still refuses to leave a water
+  parameter unset. ``JuraClient.brew`` now treats a bare ``@tp`` as
+  the accept and ``@tp:00`` as a rejection.
 - **Flood-guard on the recipe blob.** `build_recipe_hex` now *raises*
   when a water/ml parameter the product has would be left unset (no
   override and no XML default) instead of shipping its ``FF`` byte

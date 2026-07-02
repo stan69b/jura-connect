@@ -17,7 +17,7 @@ end-to-end against a **JURA S8 EB** running firmware **TT237W V06.11**
 | storage of authentication codes | ✓ |
 | Read commands: maintenance counters, maintenance %, machine status / alerts, screen lock/unlock | ✓ |
 | Per-machine profiles — 88 bundled XMLs from the J.O.E. APK; alert names + product codes are looked up per `EF_code` so a Cortado on an S8 EB names itself, not `0x2B=2` | ✓ |
-| Brewing by product name — `brew hotwater water=220 temp=high` — with water / strength / temperature / milk overrides validated against the machine XML | ✓ ; the `@TP:` recipe-blob format is verified live on an E8 (EB) / EF538, see §5.9 of [`docs/PROTOCOL.md`](docs/PROTOCOL.md) |
+| Brewing by product name — `brew hotwater water=220 temp=high` — with water / strength / temperature / milk overrides validated against the machine XML | ✓ ; the `@TP:` recipe-blob format is verified by physically brewing on a JURA S8 EB (EF1091) and an E6, see §5.9 of [`docs/PROTOCOL.md`](docs/PROTOCOL.md) |
 | Other writes / maintenance processes | available but require extra attention |
 
 ## Installation
@@ -373,14 +373,18 @@ product accepts comes from its machine-XML entry.
 > ticks, seconds as-is) but have not been confirmed against a physical
 > machine. Only water and temperature are live-verified.
 
-The wire command is **not** a bare product code: TT237W-family WiFi
-firmware ACKs `@TP:0D` with `@tp` and then silently ignores it. The
-working format is a 16-byte recipe blob with the product code at byte
-0 and each XML parameter at its `Argument` offset minus one — water
-in 5 ml ticks, where an unset byte means 255 ticks (≈ 1.3 l!), which
-is why `brew` always sends the full validated blob. See §5.9 of
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the layout, verified live
-on an E8 (EB) / EF538.
+The wire command is **not** a bare product code, and **not** an
+FF-padded blob: the firmware ACKs both with `@tp:00` and silently
+ignores them. The working format is a 16-byte recipe blob with the
+product code at byte 0, each XML parameter at its `Argument` offset
+minus one (water/bypass in 5 ml ticks), **byte 8 = `0x01`** (a
+constant "recipe valid" byte), and every other byte `0x00`. An unset
+water byte is `0x00` = no water, so `brew` refuses to leave a water
+parameter unset and always sends the full validated blob. An accepted
+blob replies with a bare `@tp` (then `@TB`/`@TV` frames); `@tp:00`
+means rejected. See §5.9 of [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for
+the layout, verified by physically brewing on a JURA S8 EB (EF1091)
+and an E6.
 
 From Python:
 
