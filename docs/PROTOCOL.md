@@ -584,6 +584,20 @@ unused bytes are `0x00` and whose byte 8 is a constant `0x01`**:
   opts into resending the blob once if the first reply is not an accept
   (bare `@tp`). With the correct 00-pad/byte-8=01 layout it brews on
   the first send, so the retry is usually moot.
+* **Untested variants — verify on your hardware.** Live end-to-end
+  verification exists only for single-boiler coffee machines (S8 EB /
+  EF1091 by the maintainer, E6 by the upstream PR author). **Twin
+  models** (e.g. J8/J10 "twin") and any product carrying a
+  `grinder_ratio` parameter are **untested** — their blob layout may
+  differ; report back if a brew is ACKed `@tp` but nothing pours.
+* The dongle serves **one TCP session at a time**. Back-to-back
+  commands may hit a connection refusal for a moment after the previous
+  session closes — wait briefly and retry.
+* Brew builds the blob from the machine **profile**, so a machine whose
+  dongle stays silent on UDP discovery (no auto-detected EF code) must
+  have its model set once — `set-machine-type <name> <EF>` (or
+  `--machine-type <EF>`) — before `products` / `brew` resolve products
+  against the right catalogue instead of the EF536 baseline.
 
 The named `brew` command builds this blob from the machine profile —
 `brew hotwater water=220 temp=high` — validating every value against

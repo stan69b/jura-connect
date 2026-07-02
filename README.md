@@ -372,6 +372,11 @@ product accepts comes from its machine-XML entry.
 > (milk-foam) and `milk_break` are encoded from the XML (ml kinds ÷5
 > ticks, seconds as-is) but have not been confirmed against a physical
 > machine. Only water and temperature are live-verified.
+> **Twin models** (e.g. J8/J10 "twin") and any product with a
+> `grinder_ratio` parameter are untested — their blob layout may
+> differ. Machines whose dongle stays silent on UDP discovery need
+> `set-machine-type <name> <EF>` once before `products` / `brew` map to
+> the right catalogue instead of the EF536 baseline.
 
 The wire command is **not** a bare product code, and **not** an
 FF-padded blob: the firmware ACKs both with `@tp:00` and silently
