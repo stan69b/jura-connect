@@ -123,6 +123,7 @@ available commands:
     percent                  maintenance percent indicators (@TG:C0)
     status                   parsed status / active alerts (@HU? -> @TF:)
     brews                    per-product brew counters (@TR:32 paginated; 16 pages)
+    products                 list brewable products + allowed 'brew' param=value values (profile-driven; no I/O)
     pmode                    programmable-recipe slots (@TM:50 + @TM:42,<slot>); per-machine
     setting <name> [<value>] read or write a machine setting; profile-aware; write is gated
     lock                     lock the front-panel display (@TS:01)
@@ -307,6 +308,26 @@ structured result type — `MaintenanceCounters`, `MaintenancePercent`,
 `to_dict()` from Python.
 
 ### Brew a product (`brew`)
+
+Not sure what to type? `products` lists every brewable product on the
+connected machine with its resolvable name and each `param=value`
+key's allowed values (ranges/steps for water & milk, item choices for
+strength & temperature), read straight from the machine profile with
+no extra machine I/O:
+
+```sh
+$ jura-connect command --name Kaffeebert --machine-type EF538 products
+EF538 — 14 brewable product(s)
+
+espresso  (0x02)
+    strength / coffee_strength   default 8        choices: 1=01, 2=02, …, 10=0A
+    ml / water / water_amount    default 45       range 15–80 ml, step 5 (value ÷ 5 = 5 ml wire ticks)
+    temp / temperature           default high     choices: low=00, normal=01, high=02
+
+latte_macchiato  (0x07)
+    …
+    milk / milk_foam / milk_foam_amount default 22  range 1–120 s, step 1 (seconds, sent as-is)  [not live-verified — may misbrew, verify on your hardware]
+```
 
 `brew` starts a product by its 2-hex product code, by its profile
 name, or — as an escape hatch — by a full verbatim recipe blob (32+

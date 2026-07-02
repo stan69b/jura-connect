@@ -413,6 +413,199 @@ def _r_brew(_spec, client, args, timeout):
     return client.request(f"@TP:{recipe}", timeout=timeout)
 
 
+# -- products discovery -------------------------------------------------
+
+#: Recipe kinds whose blob byte is NOT confirmed against real hardware.
+_NOT_LIVE_VERIFIED_KINDS = frozenset(
+    {
+        profile.KIND_BYPASS,
+        profile.KIND_MILK_FOAM_AMOUNT,
+        profile.KIND_MILK_BREAK,
+    }
+)
+_NOT_LIVE_VERIFIED_CAVEAT = "not live-verified — may misbrew, verify on your hardware"
+
+#: kind -> (unit label, wire-encoding note) for ranged parameters.
+_KIND_UNIT: dict[str, tuple[str, str]] = {
+    profile.KIND_WATER_AMOUNT: ("ml", "value ÷ 5 = 5 ml wire ticks"),
+    profile.KIND_BYPASS: ("ml", "value ÷ 5 = 5 ml wire ticks"),
+    profile.KIND_MILK_FOAM_AMOUNT: ("s", "seconds, sent as-is"),
+    profile.KIND_MILK_BREAK: ("s", "seconds, sent as-is"),
+}
+
+
+def _cli_keys_for_kind(kind: str) -> tuple[str, ...]:
+    """Every ``brew`` param=value key that maps to ``kind`` (short first)."""
+    keys = [k for k, v in _BREW_KEY_TO_KIND.items() if v == kind]
+    return tuple(sorted(keys, key=lambda k: (len(k), k)))
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ParamInfo:
+    """One brewable recipe parameter, described for a CLI user.
+
+    ``cli_keys`` are the ``brew <product> <key>=<value>`` keys that set
+    this parameter. Enumerated params carry ``choices`` (``(name,
+    value_hex)`` in menu order); ranged params carry ``minimum`` /
+    ``maximum`` / ``step`` with a ``unit`` and ``encoding`` note.
+    ``live_verified`` is False for parameters whose wire byte has not
+    been confirmed on hardware (bypass / milk).
+    """
+
+    kind: str
+    cli_keys: tuple[str, ...]
+    default: object  # int|None (ranged) or the default item name (enum)
+    default_hex: str | None
+    choices: tuple[tuple[str, str], ...]  # (name, value_hex), enum only
+    minimum: int | None
+    maximum: int | None
+    step: int | None
+    unit: str | None
+    encoding: str | None
+    live_verified: bool
+
+    def format(self) -> str:
+        keys = " / ".join(self.cli_keys)
+        if self.choices:
+            choices = ", ".join(f"{name}={val}" for name, val in self.choices)
+            default = f"{self.default}" if self.default is not None else "-"
+            body = f"choices: {choices}"
+        else:
+            rng = f"{self.minimum}–{self.maximum}" if self.maximum is not None else "?"
+            step = f", step {self.step}" if self.step else ""
+            unit = f" {self.unit}" if self.unit else ""
+            enc = f" ({self.encoding})" if self.encoding else ""
+            default = f"{self.default}" if self.default is not None else "-"
+            body = f"range {rng}{unit}{step}{enc}"
+        caveat = "" if self.live_verified else f"  [{_NOT_LIVE_VERIFIED_CAVEAT}]"
+        return f"    {keys:<28} default {default:<8} {body}{caveat}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "cli_keys": list(self.cli_keys),
+            "default": self.default,
+            "default_hex": self.default_hex,
+            "choices": [{"name": n, "value": v} for n, v in self.choices],
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "step": self.step,
+            "unit": self.unit,
+            "encoding": self.encoding,
+            "live_verified": self.live_verified,
+        }
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductInfo:
+    """One brewable product and its recipe parameters."""
+
+    code: int
+    name: str  # resolvable snake_case name (what ``brew <name>`` accepts)
+    raw_name: str
+    params: tuple[ParamInfo, ...]
+
+    def format(self) -> str:
+        head = f"{self.name}  (0x{self.code:02X})"
+        if not self.params:
+            return head + "\n    (no adjustable parameters)"
+        return "\n".join([head, *(p.format() for p in self.params)])
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": f"{self.code:02X}",
+            "name": self.name,
+            "raw_name": self.raw_name,
+            "params": [p.to_dict() for p in self.params],
+        }
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductCatalogue:
+    """Brewable products of a machine, with allowed parameter values.
+
+    Built from the loaded :class:`~jura_connect.profile.MachineProfile`
+    — the same source :meth:`~jura_connect.client.JuraClient.brew` and
+    ``resolve_product`` use — so ``name`` is exactly what
+    ``brew <name>`` accepts. Only active (brewable) products are listed.
+    """
+
+    machine_code: str
+    products: tuple[ProductInfo, ...]
+
+    def format(self) -> str:
+        header = f"{self.machine_code} — {len(self.products)} brewable product(s)"
+        blocks = [p.format() for p in self.products]
+        return "\n\n".join([header, *blocks])
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "machine_code": self.machine_code,
+            "products": [p.to_dict() for p in self.products],
+        }
+
+
+def _param_info(param) -> ParamInfo:
+    kind = param.kind
+    live = kind not in _NOT_LIVE_VERIFIED_KINDS
+    unit, encoding = _KIND_UNIT.get(kind, (None, None))
+    if param.items:  # enumerated (strength / temperature)
+        choices = tuple((it.name, it.value) for it in param.items)
+        default_name: str | None = None
+        default_hex: str | None = None
+        if param.default is not None:
+            default_hex = f"{param.default:02X}"
+            match = next((it for it in param.items if it.value == default_hex), None)
+            default_name = match.name if match is not None else default_hex
+        return ParamInfo(
+            kind=kind,
+            cli_keys=_cli_keys_for_kind(kind),
+            default=default_name,
+            default_hex=default_hex,
+            choices=choices,
+            minimum=None,
+            maximum=None,
+            step=None,
+            unit=None,
+            encoding=None,
+            live_verified=live,
+        )
+    return ParamInfo(
+        kind=kind,
+        cli_keys=_cli_keys_for_kind(kind),
+        default=param.default,
+        default_hex=None,
+        choices=(),
+        minimum=param.minimum,
+        maximum=param.maximum,
+        step=param.step,
+        unit=unit,
+        encoding=encoding,
+        live_verified=live,
+    )
+
+
+def _r_products(_spec, client, _args, _timeout):
+    prof = client.profile
+    if prof is None:
+        raise CommandError(
+            "products: needs a machine profile. Pair with "
+            "--machine-type <EF_code> (or pass --machine-type to "
+            "'command'); see 'jura-connect machine-types'."
+        )
+    products = tuple(
+        ProductInfo(
+            code=p.code,
+            name=p.name,
+            raw_name=p.raw_name,
+            params=tuple(_param_info(pp) for pp in p.params),
+        )
+        for p in prof.products
+        if p.active
+    )
+    return ProductCatalogue(machine_code=prof.code, products=products)
+
+
 def _r_set_pin(_spec, client, args, timeout):
     pin = _ascii_arg("pin", args[0])
     if not pin.isdigit():
@@ -565,6 +758,15 @@ _SPECS: tuple[CommandSpec, ...] = (
         description="per-product brew counters (@TR:32 paginated; 16 pages)",
         arguments=(),
         runner=_r_brews,
+    ),
+    CommandSpec(
+        name="products",
+        description=(
+            "list brewable products and their allowed 'brew' param=value "
+            "ranges/choices (from the machine profile; no machine I/O)"
+        ),
+        arguments=(),
+        runner=_r_products,
     ),
     CommandSpec(
         name="pmode",
@@ -731,18 +933,23 @@ _SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="brew",
-        description="[destructive] start brewing a product (@TP:<recipe blob>)",
+        description=(
+            "[destructive] start brewing a product (@TP:<recipe blob>); "
+            "run 'products' to discover valid names and param=value ranges"
+        ),
         arguments=(
             Argument(
                 "product",
                 "profile product name ('espresso', 'hotwater'…; prefix "
-                "OK), 2-hex product code, or a full recipe blob (32+ hex)",
+                "OK), 2-hex product code, or a full recipe blob (32+ hex). "
+                "Run 'products' to list valid names",
             ),
             Argument(
                 "param=value",
                 "recipe override(s): water=<ml> strength=<level> "
                 "temp=<low|normal|high> milk=<s> milk_break=<s> "
-                "bypass=<ml>; defaults come from the machine XML",
+                "bypass=<ml>; defaults come from the machine XML. Run "
+                "'products' for each product's allowed values",
                 optional=True,
                 variadic=True,
             ),
