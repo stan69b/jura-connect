@@ -518,64 +518,72 @@ intent — running `@TG:24` will start a real cleaning cycle.
 
 ### 5.9 Product start (`@TP:`) — the recipe blob (verified live)
 
-Verified end-to-end against an **E8 (EB) / EF538** WiFi dongle
-(2026-06): brewing works, but **not** with a bare product code. The
-firmware ACKs `@TP:0D` with `@tp` and then silently does nothing —
-the same ACK-but-ignore behaviour the bare (unwrapped) `@TM:` writes
-show. What it executes is a **16-byte recipe blob**:
+Verified by **physically brewing** on a **JURA S8 EB / EF1091**
+(owner's machine "kaffeebert", 2026-07) and, independently, on an
+**E6** (upstream PR author's machine). Brewing works, but **not** with
+a bare product code and **not** with the FF-padded blob earlier
+versions of this library sent — both are ACKed and then silently
+ignored. What the machine executes is a **16-byte recipe blob whose
+unused bytes are `0x00` and whose byte 8 is a constant `0x01`**:
 
 ```
-@TP:0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF        (hot water, 220 ml, normal temp)
-     │ │ │ │ │ │ │ └─────────────────── bytes 7..15: FF (unused)
-     │ │ │ │ │ │ └── byte 6: temperature (00 low / 01 normal / 02 high)
-     │ │ │ │ │ └──── byte 5: milk-foam amount, seconds
-     │ │ │ │ └────── byte 4: (unused here)
-     │ │ │ └──────── byte 3: water amount, 5 ml ticks (0x2C = 44 = 220 ml)
-     │ │ └────────── byte 2: coffee strength level
-     │ └──────────── byte 1: (unused here)
-     └────────────── byte 0: product code
+@TP:28000709000001000109000000000000   (cafe_barista, strength 7, 45 ml, normal, bypass 45 ml)
+     │ │ │ │ │ │ │ │ │ └────────────── bytes 10..15: 00 (unused here)
+     │ │ │ │ │ │ │ │ └──────────────── byte 9:  bypass, 5 ml ticks (0x09 = 9 = 45 ml)
+     │ │ │ │ │ │ │ └────────────────── byte 8:  0x01 — constant "recipe valid" byte
+     │ │ │ │ │ │ └──────────────────── byte 7:  00 (unused here)
+     │ │ │ │ │ └────────────────────── byte 6:  temperature (00 low / 01 normal / 02 high)
+     │ │ │ │ └──────────────────────── byte 5:  milk-foam amount, seconds (unused here)
+     │ │ │ └────────────────────────── byte 4:  00 (unused here)
+     │ │ └──────────────────────────── byte 3:  water amount, 5 ml ticks (0x09 = 9 = 45 ml)
+     │ └────────────────────────────── byte 2:  coffee strength level (0x07 = 7)
+     └──────────────────────────────── byte 0:  product code (byte 1 unused = 00)
 ```
 
+* **Padding is `0x00`, and byte 8 is always `0x01`.** An FF-padded
+  blob (`@TP:28FF0709FFFF01FFFF09FF…`) is ACKed `@tp:00` and does
+  **nothing** — no `@TB`/`@TV` frames, counter unchanged, tried both
+  single- and double-send. The 00-padded, byte-8=01 form brews on the
+  first send. Byte 8 is a fixed structural byte: no bundled product
+  carries a parameter there (nothing uses `Argument="F9"`).
 * **Byte positions come from the machine XML.** Every PRODUCT element
   lists its parameters with an `Argument="F<n>"` attribute
-  (WATER_AMOUNT at F4, COFFEE_STRENGTH at F3, MILK_FOAM_AMOUNT at F6,
+  (COFFEE_STRENGTH at F3, WATER_AMOUNT at F4, MILK_FOAM_AMOUNT at F6,
   TEMPERATURE at F7, BYPASS at F10, MILK_BREAK at F11). The F-numbers
   are the byte offsets of the *Bluetooth* start-product command, which
   carries a leading key byte; the WiFi blob does not, so **blob offset
   = F − 1**.
-* **Water is sent in 5 ml ticks** (`ml / 5`, one byte), matching the
-  Jutta-Proto Bluetooth finding "1 second = 5 ml". XML `Value`/ `Min`/
-  `Max` attributes are in ml. Milk foam and milk break are seconds,
-  sent as-is; strength is the level number.
-* **Bypass and milk-foam / milk-break encodings are NOT live-verified
-  — they may misbrew; verify on your hardware.** Bypass shares
-  water's ml÷5 tick semantics in the XML and milk values are treated
-  as seconds, but only water and temperature have been confirmed
-  against a physical machine (E8 (EB) / EF538). The library exposes
-  these overrides anyway (with the same caveat in the docstrings).
-* **Firmware-family layout differences exist.** The blob above (FF
-  padding, no byte-8 flag) is the E8 (EB) / EF538 layout. E6-family
-  vectors observed in the wild are **00-padded** and set byte 8 to
-  `01` — e.g. `@TP:02000809000002000100000000000000` (default
-  Espresso) and `@TP:0300021A000001000100000000000000` (Coffee,
-  strength 2, 130 ml, normal). The offsets and ml÷5 scaling still
-  hold, but the padding/flag differ, so the builder's FF-padded blob
-  will not be byte-identical on those machines. Use the verbatim-blob
-  escape hatch there until the layout is confirmed.
-* **`FF` means "parameter not set"** — for parameters the product
-  doesn't have. *Never* leave a parameter the product does have at
-  `FF`: an unset water byte reads as 255 ticks ≈ **1.275 litres** of
-  water headed for a 220 ml cup. (Found out empirically. The cup did
-  not survive unassisted.)
+* **Water and bypass are sent in 5 ml ticks** (`ml / 5`, one byte).
+  XML `Value`/`Min`/`Max` attributes are in ml. Milk foam and milk
+  break are seconds, sent as-is; strength is the level number;
+  temperature is the ITEM value (00/01/02).
+* **Live-verified:** water, temperature, strength and bypass, from the
+  three cross-model vectors (S8 EB `cafe_barista`, E6 `espresso`, E6
+  `coffee`). **Not individually live-verified — may misbrew, verify on
+  your hardware:** `milk_foam_amount` / `milk_break` (seconds, as-is).
+* **`0x00` means "parameter not set"** — for parameters the product
+  doesn't have. A water byte the product *does* have must still be set
+  explicitly: with 00-padding an unset water byte is `0x00` = **no
+  water** (a dry/short shot), so `build_recipe_hex` refuses to leave it
+  unset rather than guess.
+* Cross-model verified vectors (all 00-padded, byte 8 = 01):
+  `@TP:28000709000001000109000000000000` (S8 EB cafe_barista),
+  `@TP:02000809000002000100000000000000` (E6 default espresso),
+  `@TP:0300021A000001000100000000000000` (E6 coffee, strength 2,
+  130 ml, normal).
 * No trailing checksum is needed (unlike `@TM:` writes), and no
   `@TS:01`/`@TS:00` lock wrapper is required.
-* Reply behaviour: the dongle ACKs the accepted blob with `@tp`, then
-  emits `@TB` when the brew starts, `@TV:41<code>…` progress frames
-  (byte 4 = current tick, byte 5 = target ticks, second-to-last byte =
-  percent 0x00–0x64), and `@TV:3E<code>` on completion.
+* Reply behaviour: the dongle ACKs an **accepted** blob with a bare
+  `@tp`, then emits `@TB` when the brew starts, `@TV:41<code>…`
+  progress frames (byte 4 = current tick, byte 5 = target ticks,
+  second-to-last byte = percent 0x00–0x64), and `@TV:3E<code>` on
+  completion. A **rejected/ignored** blob gets `@tp:00` and no further
+  frames — `@tp:00` is *not* an accept.
 * A machine in `energy_safe` wakes on the first `@TP:` but may ignore
   that first command; a retry then brews. `JuraClient.brew(retry=True)`
-  opts into resending the blob once if the first reply isn't `@tp`.
+  opts into resending the blob once if the first reply is not an accept
+  (bare `@tp`). With the correct 00-pad/byte-8=01 layout it brews on
+  the first send, so the retry is usually moot.
 
 The named `brew` command builds this blob from the machine profile —
 `brew hotwater water=220 temp=high` — validating every value against

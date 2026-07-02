@@ -241,16 +241,27 @@ class SettingDef:
         )
 
 
-#: Total length of the ``@TP:`` recipe blob in bytes. Verified live
-#: against an E8 (EB) / EF538: the dongle ACKs and brews a 16-byte
-#: payload, while a bare product code is ACKed but silently ignored.
+#: Total length of the ``@TP:`` recipe blob in bytes. Live-verified by
+#: physically brewing on a JURA S8 EB (EF1091) and, independently, an
+#: E6: the machine ACKs and brews a 16-byte payload whose *unused*
+#: bytes are ``0x00`` (see :meth:`ProductDef.build_recipe_hex`); a
+#: bare product code, or an FF-padded blob, is ACKed ``@tp:00`` and
+#: silently ignored.
 RECIPE_BLOB_BYTES = 16
+
+#: Blob byte index that must always be ``0x01`` for the machine to
+#: accept and brew the recipe. Observed constant across every
+#: hardware-verified vector (S8 EB cafe_barista, E6 espresso, E6
+#: coffee); no bundled product carries a parameter at this index
+#: (nothing uses ``Argument="F9"``), so it is a fixed structural byte.
+_RECIPE_VALID_BYTE_INDEX = 8
+_RECIPE_VALID_BYTE = "01"
 
 #: Recipe-parameter kinds whose XML values are millilitres encoded on
 #: the wire as 5 ml ticks (one byte). WATER_AMOUNT is live-verified on
-#: an E8 (EB): sending 0x2C (44 ticks) dispensed exactly 220 ml.
-#: BYPASS shares WATER_AMOUNT's ml semantics in the XML (ml-ranged,
-#: Step=5) so it gets the same encoding; not yet live-verified.
+#: the S8 EB (EF1091): water at 45 ml lands as 0x09 (9 ticks). BYPASS
+#: shares WATER_AMOUNT's ml semantics in the XML (ml-ranged, Step=5)
+#: and is live-verified on the S8 EB (cafe_barista bypass 45 ml -> 0x09).
 _ML_TICK_KINDS = frozenset({"water_amount", "bypass"})
 
 #: 5 ml per wire tick for the kinds above (matches the Bluetooth
@@ -355,7 +366,7 @@ class ProductParam:
                 ) from exc
         _validate_ranged(value, self.minimum, self.maximum, self.step, self.kind)
         wire = value // _ML_PER_TICK if self.kind in _ML_TICK_KINDS else value
-        if not 0 <= wire <= 0xFE:  # 0xFF means "parameter not set"
+        if not 0 <= wire <= 0xFF:  # single unsigned byte
             raise ValueError(f"{self.kind}: {value} does not fit the wire byte")
         return wire
 
@@ -394,37 +405,51 @@ class ProductDef:
     def build_recipe_hex(self, overrides: dict[str, int | str] | None = None) -> str:
         """Build the 16-byte ``@TP:`` recipe blob for this product.
 
-        Blob layout (verified live against an E8 (EB) / EF538):
+        Blob layout — **live-verified by physically brewing** on a JURA
+        S8 EB (EF1091) and, independently, an E6:
 
         * byte 0 — the product code;
-        * byte ``F-1`` for every XML parameter (water at F4 → byte 3
-          in 5 ml ticks, strength at F3 → byte 2, milk foam at F6 →
-          byte 5 in seconds, temperature at F7 → byte 6 as 00/01/02);
-        * ``FF`` everywhere else ("parameter not set").
+        * byte ``F-1`` for every XML parameter (strength at F3 → byte 2,
+          water at F4 → byte 3 in 5 ml ticks, milk foam at F6 → byte 5
+          in seconds, temperature at F7 → byte 6 as 00/01/02, bypass at
+          F10 → byte 9 in 5 ml ticks, milk break at F11 → byte 10);
+        * **byte 8 → ``0x01``** always (a fixed structural / "recipe
+          valid" byte; no bundled product uses ``F9``);
+        * **``0x00`` everywhere else** ("parameter not set").
+
+        The earlier FF-padded layout was never physically brewed and is
+        wrong: the machine ACKs an FF-padded blob with ``@tp:00`` and
+        silently does nothing (no ``@TB`` / ``@TV`` frames, counters
+        unchanged). The 00-padded, byte-8=01 form brews on the first
+        send. See PROTOCOL.md §5.9.
 
         ``overrides`` maps parameter kinds to values in XML units,
         e.g. ``{"water_amount": 220, "temperature": "high"}``. Use the
         ``KIND_*`` constants for the keys. Parameters not overridden
         fall back to the XML default. Values are validated against the
-        XML catalogue *before* anything goes on the wire — an unset
-        water byte (``FF`` = 255 ticks) would brew **1.275 litres**,
-        which is exactly the accident this helper exists to prevent.
+        XML catalogue *before* anything goes on the wire.
 
         **Not live-verified — may misbrew, verify on your hardware:**
-        the ``bypass`` and ``milk_foam_amount`` / ``milk_break``
-        encodings are inferred from the XML (ml kinds ÷5 ticks, seconds
-        as-is), not confirmed against a physical machine. Water and
-        temperature *are* live-verified (E8 (EB) / EF538).
+        the ``milk_foam_amount`` / ``milk_break`` encodings are inferred
+        from the XML (seconds, sent as-is), not individually confirmed.
+        Water, temperature, strength and bypass are live-verified on the
+        S8 EB.
 
         Raises :class:`ValueError` on unknown override kinds, on
-        out-of-range values, and — importantly — when a millilitre
-        parameter the product *has* would be left unset (no override
-        and no XML default): sending its ``FF`` byte would flood the
-        cup, so this is refused rather than guessed.
+        out-of-range values, and when a millilitre parameter the product
+        *has* would be left unset (no override and no XML default):
+        with 00-padding that byte would be ``0x00`` = **no water**, so
+        rather than silently brew a dry/short shot this is refused —
+        pass an explicit amount.
         """
         overrides = dict(overrides or {})
-        blob = ["FF"] * RECIPE_BLOB_BYTES
+        blob = ["00"] * RECIPE_BLOB_BYTES
         blob[0] = f"{self.code:02X}"
+        # Fixed structural byte required for the machine to brew; set
+        # before the param loop so a (hypothetical, currently
+        # non-existent) F9 param would take precedence rather than be
+        # clobbered.
+        blob[_RECIPE_VALID_BYTE_INDEX] = _RECIPE_VALID_BYTE
         for p in self.params:
             if not 0 < p.offset < RECIPE_BLOB_BYTES:
                 raise ValueError(
@@ -437,7 +462,7 @@ class ProductDef:
                     raise ValueError(
                         f"{self.name}: water-amount parameter {p.kind!r} has no "
                         f"value and no XML default; refusing to leave its byte at "
-                        f"FF (=255 ticks ≈ 1.3 l flood). Pass an explicit amount."
+                        f"0x00 (= no water). Pass an explicit amount."
                     )
                 continue
             blob[p.offset] = f"{p.encode(value):02X}"
