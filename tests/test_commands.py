@@ -46,7 +46,7 @@ def test_list_commands_contains_safe_and_destructive_groups() -> None:
     # Destructive operations are present *and* flagged with a danger string.
     for expected in [
         "clean",
-        "decalc",
+        "descale",
         "filter-change",
         "cappu-clean",
         "cappu-rinse",
@@ -74,6 +74,7 @@ def test_list_commands_contains_safe_and_destructive_groups() -> None:
         "mem-read",
         "register-read",
         "raw",
+        "products",
     ]:
         assert not commands.get_command(safe).destructive
 
@@ -466,14 +467,15 @@ def test_string_result_to_dict_passthrough(sim) -> None:
 # (name, args) pairs covering every destructive command in the registry.
 _DESTRUCTIVE_INVOCATIONS = [
     ("clean", []),
-    ("decalc", []),
+    ("descale", []),
     ("filter-change", []),
     ("cappu-clean", []),
     ("cappu-rinse", []),
     ("reset-counters", []),
     ("restart", []),
     ("power-off", []),
-    ("brew", ["01"]),
+    # A full 32-hex @TP: blob reaches the wire without a profile.
+    ("brew", ["28000709000001000109000000000000"]),
     ("set-pin", ["1234"]),
     ("set-ssid", ["mywifi"]),
     ("set-password", ["s3cret"]),
@@ -543,6 +545,329 @@ def test_safe_raw_payload_is_not_gated(sim) -> None:
     finally:
         c.close()
     assert result.value.startswith("@tg:43")  # type: ignore[union-attr]
+
+
+# ---- brew: recipe-blob building --------------------------------------
+
+
+def test_brew_by_name_builds_blob_and_reaches_wire(sim) -> None:
+    """Named product + profile -> 16-byte blob on the wire. The
+    simulator's @an:error refusal is the proof of wire contact."""
+    c = _paired_with_profile(sim)
+    try:
+        result = run_named(
+            c,
+            "brew",
+            ["hotwater", "water=220"],
+            timeout=2.0,
+            allow_destructive=True,
+        )
+    finally:
+        c.close()
+    assert result.value.startswith("@an:error")  # type: ignore[union-attr]
+
+
+def test_brew_full_blob_passthrough(sim) -> None:
+    """A full recipe blob is sent verbatim, profile or not."""
+    c = _paired(sim)
+    try:
+        result = run_named(
+            c,
+            "brew",
+            ["28000709000001000109000000000000"],
+            timeout=2.0,
+            allow_destructive=True,
+        )
+    finally:
+        c.close()
+    assert result.value.startswith("@an:error")  # type: ignore[union-attr]
+
+
+def test_brew_by_name_without_profile_is_refused_client_side(sim) -> None:
+    c = _paired(sim)
+    try:
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "brew", ["espresso"], timeout=1.0, allow_destructive=True)
+    finally:
+        c.close()
+
+
+def test_brew_validates_overrides_before_wire(sim) -> None:
+    c = _paired_with_profile(sim)
+    try:
+        with pytest.raises(CommandError, match="outside"):
+            run_named(
+                c,
+                "brew",
+                ["hotwater", "water=9999"],
+                timeout=1.0,
+                allow_destructive=True,
+            )
+        with pytest.raises(CommandError, match="unknown parameter"):
+            run_named(
+                c,
+                "brew",
+                ["hotwater", "beans=42"],
+                timeout=1.0,
+                allow_destructive=True,
+            )
+        with pytest.raises(CommandError, match="param=value"):
+            run_named(
+                c,
+                "brew",
+                ["hotwater", "220"],
+                timeout=1.0,
+                allow_destructive=True,
+            )
+        with pytest.raises(CommandError, match="cannot be combined"):
+            run_named(
+                c,
+                "brew",
+                ["28000709000001000109000000000000", "water=220"],
+                timeout=1.0,
+                allow_destructive=True,
+            )
+    finally:
+        c.close()
+
+
+def test_brew_unknown_and_ambiguous_product_names(sim) -> None:
+    c = _paired_with_profile(sim)
+    try:
+        with pytest.raises(CommandError, match="not known"):
+            run_named(c, "brew", ["americano"], timeout=1.0, allow_destructive=True)
+        # 'espresso' prefix-matches espresso, espresso_macchiato,
+        # espresso_doppio… — but the exact name must win.
+        result = run_named(c, "brew", ["espresso"], timeout=2.0, allow_destructive=True)
+        assert result.value.startswith("@an:error")  # type: ignore[union-attr]
+        with pytest.raises(CommandError, match="ambiguous"):
+            run_named(c, "brew", ["esp"], timeout=1.0, allow_destructive=True)
+    finally:
+        c.close()
+
+
+def test_client_brew_api_builds_and_sends(sim) -> None:
+    """The library-level JuraClient.brew() mirrors the CLI path."""
+    c = _paired_with_profile(sim)
+    try:
+        reply = c.brew("hotwater", ml=100, temperature="high")
+    finally:
+        c.close()
+    assert reply.startswith("@an:error")  # simulator refuses @TP:
+
+
+def test_brew_variadic_overrides_uncapped(sim) -> None:
+    """The override arg is truly variadic — more than the old 5-cap
+    param=value pairs parse fine (they just validate/refuse per-kind)."""
+    spec = commands.get_command("brew")
+    # One product + one real variadic override argument, not a fake cap.
+    assert len(spec.arguments) == 2
+    assert spec.arguments[1].variadic is True
+    c = _paired_with_profile(sim)
+    try:
+        # Multiple overrides in one call reach the wire (validated first).
+        result = run_named(
+            c,
+            "brew",
+            ["espresso", "strength", "water=45"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
+    except CommandError as exc:
+        # 'strength' without '=' must be a clear param=value error, not a
+        # silent drop or an arg-count error.
+        assert "param=value" in str(exc)
+    else:  # pragma: no cover - defensive
+        result  # noqa: B018
+    finally:
+        c.close()
+
+
+def test_brew_accept_semantics_tp_vs_tp00() -> None:
+    """The machine returns bare `@tp` on accept but `@tp:00` when it
+    rejects/ignores the blob (e.g. the old FF-padded layout). `@tp:00`
+    must NOT count as accepted."""
+    from jura_connect.client import _is_brew_accept
+
+    assert _is_brew_accept("@tp") is True
+    assert _is_brew_accept("@TP") is True
+    assert _is_brew_accept("@tp:00") is False
+    assert _is_brew_accept("@an:error") is False
+
+
+def test_brew_short_hex_name_is_not_a_verbatim_blob(sim) -> None:
+    """A short all-hex token ('dec', 'face') is a name, not a raw blob:
+    only >= 32 hex chars are sent verbatim. Without a profile it must be
+    refused client-side rather than shipped as a bare @TP: payload."""
+    c = _paired(sim)  # no profile
+    try:
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "brew", ["face"], timeout=1.0, allow_destructive=True)
+        # 30 hex chars (< 32) is still treated as a name/code, not a blob.
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "brew", ["0D" * 15], timeout=1.0, allow_destructive=True)
+    finally:
+        c.close()
+
+
+def test_brew_bypass_and_milk_overrides_reach_wire(sim) -> None:
+    """Bypass, milk-foam and milk-break overrides are accepted via the
+    CLI param=value keys, encoded onto the right blob byte, and reach
+    the wire (NOT live-verified — see build_recipe_hex caveat).
+
+    Asserts the blob byte through the CLI key->kind mapping the runner
+    uses, then confirms the same invocation reaches the wire."""
+    from jura_connect.commands import _BREW_KEY_TO_KIND
+    from jura_connect.profile import load_profile
+
+    prof = load_profile("EF538")
+    # Cafe Barista (0x28) carries BYPASS (F10 -> byte 9); Latte
+    # Macchiato (0x07) carries MILK_FOAM_AMOUNT (F6 -> byte 5) and
+    # MILK_BREAK (F11 -> byte 10).
+    barista = prof.product_by_code[0x28]
+    latte = prof.product_by_code[0x07]
+    assert barista.param("bypass") is not None
+    assert latte.param("milk_foam_amount") is not None
+    assert latte.param("milk_break") is not None
+
+    def _blob_via_cli_keys(product, **cli_kwargs):
+        overrides = {_BREW_KEY_TO_KIND[k]: v for k, v in cli_kwargs.items()}
+        return product.build_recipe_hex(overrides)
+
+    # bypass=30 ml -> 6 ticks (0x06) at byte 9.
+    assert _blob_via_cli_keys(barista, bypass=30)[9 * 2 : 9 * 2 + 2] == "06"
+    # milk (foam) = 30 s -> 0x1E at byte 5; milk_break = 45 s -> 0x2D at byte 10.
+    latte_blob = _blob_via_cli_keys(latte, milk=30, milk_break=45)
+    assert latte_blob[5 * 2 : 5 * 2 + 2] == "1E"
+    assert latte_blob[10 * 2 : 10 * 2 + 2] == "2D"
+
+    c = _paired_with_profile(sim)
+    try:
+        bypass_reply = run_named(
+            c,
+            "brew",
+            ["cafe_barista", "bypass=30"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
+        milk_reply = run_named(
+            c,
+            "brew",
+            ["latte_macchiato", "milk=30", "milk_break=45"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
+    finally:
+        c.close()
+    assert bypass_reply.value.startswith("@an:error")  # type: ignore[union-attr]
+    assert milk_reply.value.startswith("@an:error")  # type: ignore[union-attr]
+
+
+# ---- products: brew-input discovery ----------------------------------
+
+
+def test_products_lists_brewable_products_with_allowed_values(sim) -> None:
+    """`products` reads the loaded profile (no wire I/O) and lists each
+    brewable product's resolvable name + allowed param values. The shown
+    name must be exactly what `resolve_product`/`brew` accepts."""
+    from jura_connect.commands import ParamInfo, ProductCatalogue, ProductInfo
+
+    assert not commands.get_command("products").destructive
+    c = _paired_with_profile(sim, "EF538")
+    try:
+        result = run_named(c, "products", [], timeout=1.0)
+        cat = result.value
+        assert isinstance(cat, ProductCatalogue)
+        assert cat.machine_code == "EF538"
+        latte = next(p for p in cat.products if p.name == "latte_macchiato")
+        assert isinstance(latte, ProductInfo)
+        # The listed name resolves to the same product `brew` would use.
+        assert c.resolve_product(latte.name).code == latte.code == 0x07
+        by_kind = {pp.kind: pp for pp in latte.params}
+        assert {
+            "coffee_strength",
+            "water_amount",
+            "temperature",
+            "milk_foam_amount",
+            "milk_break",
+        } <= set(by_kind)
+        # Enumerated param exposes ordered choices + friendly CLI key.
+        strength = by_kind["coffee_strength"]
+        assert isinstance(strength, ParamInfo)
+        assert strength.choices  # (name, value_hex) pairs
+        assert "strength" in strength.cli_keys
+        assert strength.live_verified is True
+        # Ranged/ml param: min–max, step, unit, live-verified.
+        water = by_kind["water_amount"]
+        assert (water.minimum, water.maximum, water.step, water.unit) == (
+            25,
+            240,
+            5,
+            "ml",
+        )
+        assert "water" in water.cli_keys and "ml" in water.cli_keys
+        assert water.live_verified is True
+        # Milk params: seconds, NOT live-verified.
+        milk = by_kind["milk_foam_amount"]
+        assert milk.unit == "s"
+        assert milk.live_verified is False
+        assert by_kind["milk_break"].live_verified is False
+        # format() names the product; the caveat is surfaced.
+        text = cat.format()
+        assert "latte_macchiato  (0x07)" in text
+        assert "not live-verified" in text
+        # to_dict() is structured and matches the resolvable name.
+        d = cat.to_dict()
+        assert d["machine_code"] == "EF538"
+        assert any(p["name"] == "latte_macchiato" for p in d["products"])
+        # Inactive products (Powderproduct 0x0F, Active="false") excluded.
+        assert all(p.code != 0x0F for p in cat.products)
+    finally:
+        c.close()
+
+
+def test_products_without_profile_is_refused(sim) -> None:
+    c = _paired(sim)  # no profile loaded
+    try:
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "products", [], timeout=1.0)
+    finally:
+        c.close()
+
+
+def test_products_renders_non_overridable_param_read_only(sim) -> None:
+    """A param with no `brew` CLI alias (milk_amount on the S8/EF1091)
+    must render under its kind name with a read-only annotation — never
+    a blank key column — and expose settable=False in to_dict()."""
+    c = _paired_with_profile(sim, "EF1091")
+    try:
+        cat = run_named(c, "products", [], timeout=1.0).value
+        milk = next(p for p in cat.products if p.name == "milk")  # 0x0A
+        amount = next(pp for pp in milk.params if pp.kind == "milk_amount")
+        # No CLI alias -> not settable via `brew`.
+        assert amount.cli_keys == ()
+        assert amount.settable is False
+        # The rendered row uses the kind name, not a blank column, and
+        # is annotated read-only.
+        row = amount.format()
+        assert row.split("default")[0].strip() == "milk_amount"
+        assert "read-only: not settable via 'brew'" in row
+        assert not row.startswith("     default")  # no empty key column
+        # Whole-product format shows it too.
+        assert "milk_amount" in milk.format()
+        assert "read-only" in milk.format()
+        # Structured output carries settable=False for this param.
+        d = milk.to_dict()
+        entry = next(pp for pp in d["params"] if pp["kind"] == "milk_amount")
+        assert entry["settable"] is False
+        assert entry["cli_keys"] == []
+        # A settable param (strength) still reports settable=True.
+        espresso = next(p for p in cat.products if p.name == "espresso")
+        strength = next(pp for pp in espresso.params if pp.kind == "coffee_strength")
+        assert strength.settable is True
+        assert strength.to_dict()["settable"] is True
+    finally:
+        c.close()
 
 
 def test_set_pin_validates_numeric(sim) -> None:

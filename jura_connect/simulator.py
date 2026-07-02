@@ -20,7 +20,7 @@ The simulator models:
   connection so reader code in the client can be exercised.
 
 It deliberately refuses to model write/process commands (``@TG:24``
-cleaning, ``@TG:25`` decalc, etc.) -- it answers ``@an:error`` so
+cleaning, ``@TG:25`` descale, etc.) -- it answers ``@an:error`` so
 tests that accidentally trigger those during development surface a
 clear failure instead of silently "working".
 """
