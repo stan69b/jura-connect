@@ -359,3 +359,52 @@ def test_parse_xml_handles_default_namespace():
     assert p.alert_by_bit[0].severity == "error"
     assert p.alert_by_bit[10].severity == "info"
     assert p.product_by_code[0x02].name == "espresso"
+
+
+def test_milk_amount_f5_parsed_and_encoded():
+    """MILK_AMOUNT (F5 -> blob byte 4) — the milk *liquid* phase.
+
+    Z10-class machines split milk into MILK_AMOUNT (F5) and
+    MILK_FOAM_AMOUNT (F6). EF545 Milkcoffee: milk default 7 s,
+    range 1..45 step 1."""
+    p = load_profile("EF545")
+    milkcoffee = p.product_by_code[0x05]
+    milk = milkcoffee.param("milk_amount")
+    assert milk is not None
+    assert milk.offset == 4
+    assert (milk.default, milk.minimum, milk.maximum, milk.step) == (7, 1, 45, 1)
+
+
+def test_build_recipe_hex_z10_live_verified_milk_vector():
+    """Live-verified on a Z10 (EA) / EF545: this exact blob was brewed and
+    the physical pour matched — milk ran ~3 s (byte 4) and foam ~2 s
+    (byte 5), water 90 ml, strength 8, temperature high."""
+    p = load_profile("EF545")
+    milkcoffee = p.product_by_code[0x05]
+    blob = milkcoffee.build_recipe_hex(
+        {
+            "coffee_strength": 8,
+            "water_amount": 90,
+            "milk_amount": 3,
+            "milk_foam_amount": 2,
+            "temperature": "high",
+        }
+    )
+    assert blob == "05000812030202000100000000000000"
+
+
+def test_sub_indexed_arguments_are_skipped():
+    """``Argument="F14_1"`` (MILK_FOAM_TEMP) must not become a parameter.
+
+    Regression: int("14_1") == 141 (PEP 515 underscore separators), which
+    used to yield offset 140 and made build_recipe_hex raise for every
+    product carrying milk-temperature parameters — i.e. every Z10 milk
+    drink. Sub-indexed arguments have unknown wire semantics and are
+    skipped entirely."""
+    p = load_profile("EF545")
+    milkcoffee = p.product_by_code[0x05]
+    assert milkcoffee.param("milk_foam_temp") is None
+    assert milkcoffee.param("milk_temp") is None
+    # And the defaults blob builds instead of raising.
+    blob = milkcoffee.build_recipe_hex()
+    assert blob == "05000512070301000100000000000000"
