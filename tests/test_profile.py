@@ -15,13 +15,16 @@ from jura_connect.profile import (
 )
 
 
-def test_list_profile_codes_returns_88_machines():
+def test_list_profile_codes_returns_89_machines():
     codes = list_profile_codes()
-    # The APK we vendored ships 88 machine XMLs.
-    assert len(codes) == 88
-    # Must include the S8 EB (EF1091) and the legacy S8 (EF536).
+    # The vendored APK ships 88 machine XMLs; EF1125 (S10) was added on
+    # top, so 89.
+    assert len(codes) == 89
+    # Must include the S8 EB (EF1091), the legacy S8 (EF536), and the
+    # S10 (EF1125).
     assert "EF1091" in codes
     assert "EF536" in codes
+    assert "EF1125" in codes
 
 
 def test_ef1091_has_s8_eb_specific_products():
@@ -54,6 +57,20 @@ def test_alert_severity_lifted_from_xml_type_attribute():
     # 'cappu rinse alert' is Type="ip" => severity "process".
     assert p.alert_by_bit[35].name == "cappu_rinse_alert"
     assert p.alert_by_bit[35].severity == "process"
+
+
+def test_ef1069_maps_high_byte7_status_bits():
+    """The J8 (SAS / EF1069) status frame carries bits in byte 7 that the
+    EF536 baseline codebook (which stops at bit 38) doesn't know about.
+    These are what the J8's @TF: frame actually exercises, so the profile
+    must define them. See makefu/jura-connect-hass#3."""
+    p = load_profile("EF1069")
+    # bit 54 is set in every J8 frame at idle ("ML/OZ status").
+    assert p.alert_by_bit[54].name == "ml_oz_status"
+    assert p.alert_by_bit[54].severity == "info"
+    # bit 56 toggles when a cup is placed under the coffee eye.
+    assert p.alert_by_bit[56].name == "coffee_eye_cup_detected"
+    assert p.alert_by_bit[56].severity == "info"
 
 
 def test_unknown_profile_code_raises():
