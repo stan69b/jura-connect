@@ -80,9 +80,13 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   with units for water & milk, ordered item choices for strength &
   temperature), read from the loaded machine profile with no extra
   machine I/O. Params that are not live-verified (bypass/milk) carry
-  the caveat. Returns a `ProductCatalogue` result with `.format()`
-  (human tree) and `.to_dict()` (structured). Use it to discover
-  exactly what `brew` accepts.
+  the caveat. Params the machine reports but that are not overridable
+  via `brew` (no CLI key, e.g. `milk_amount` on the S8) render under
+  their kind name with a read-only annotation and `settable: false` in
+  the structured output — never a blank column. Returns a
+  `ProductCatalogue` result with `.format()` (human tree) and
+  `.to_dict()` (structured). Use it to discover exactly what `brew`
+  accepts.
 
 ## [0.9.4] — 2026-05-12
 
