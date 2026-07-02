@@ -445,7 +445,11 @@ class ParamInfo:
     """One brewable recipe parameter, described for a CLI user.
 
     ``cli_keys`` are the ``brew <product> <key>=<value>`` keys that set
-    this parameter. Enumerated params carry ``choices`` (``(name,
+    this parameter; ``settable`` is True exactly when it has at least
+    one such key. Some product params (e.g. ``milk_amount`` on the S8)
+    are reported by the machine XML but are NOT overridable via
+    ``brew`` — they carry no CLI key and are shown read-only under
+    their kind name. Enumerated params carry ``choices`` (``(name,
     value_hex)`` in menu order); ranged params carry ``minimum`` /
     ``maximum`` / ``step`` with a ``unit`` and ``encoding`` note.
     ``live_verified`` is False for parameters whose wire byte has not
@@ -454,6 +458,7 @@ class ParamInfo:
 
     kind: str
     cli_keys: tuple[str, ...]
+    settable: bool  # overridable via `brew` param=value (i.e. has a CLI key)
     default: object  # int|None (ranged) or the default item name (enum)
     default_hex: str | None
     choices: tuple[tuple[str, str], ...]  # (name, value_hex), enum only
@@ -465,7 +470,9 @@ class ParamInfo:
     live_verified: bool
 
     def format(self) -> str:
-        keys = " / ".join(self.cli_keys)
+        # Never emit a blank key column: fall back to the kind name for
+        # params with no `brew` CLI alias.
+        label = " / ".join(self.cli_keys) if self.settable else self.kind
         if self.choices:
             choices = ", ".join(f"{name}={val}" for name, val in self.choices)
             default = f"{self.default}" if self.default is not None else "-"
@@ -477,13 +484,19 @@ class ParamInfo:
             enc = f" ({self.encoding})" if self.encoding else ""
             default = f"{self.default}" if self.default is not None else "-"
             body = f"range {rng}{unit}{step}{enc}"
-        caveat = "" if self.live_verified else f"  [{_NOT_LIVE_VERIFIED_CAVEAT}]"
-        return f"    {keys:<28} default {default:<8} {body}{caveat}"
+        if not self.settable:
+            annot = "  (read-only: not settable via 'brew')"
+        elif not self.live_verified:
+            annot = f"  [{_NOT_LIVE_VERIFIED_CAVEAT}]"
+        else:
+            annot = ""
+        return f"    {label:<28} default {default:<8} {body}{annot}"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "kind": self.kind,
             "cli_keys": list(self.cli_keys),
+            "settable": self.settable,
             "default": self.default,
             "default_hex": self.default_hex,
             "choices": [{"name": n, "value": v} for n, v in self.choices],
@@ -547,6 +560,10 @@ class ProductCatalogue:
 
 def _param_info(param) -> ParamInfo:
     kind = param.kind
+    cli_keys = _cli_keys_for_kind(kind)
+    # A param is overridable via `brew` only when it has a CLI key. Some
+    # machine-reported params (e.g. milk_amount on the S8) have none.
+    settable = bool(cli_keys)
     live = kind not in _NOT_LIVE_VERIFIED_KINDS
     unit, encoding = _KIND_UNIT.get(kind, (None, None))
     if param.items:  # enumerated (strength / temperature)
@@ -559,7 +576,8 @@ def _param_info(param) -> ParamInfo:
             default_name = match.name if match is not None else default_hex
         return ParamInfo(
             kind=kind,
-            cli_keys=_cli_keys_for_kind(kind),
+            cli_keys=cli_keys,
+            settable=settable,
             default=default_name,
             default_hex=default_hex,
             choices=choices,
@@ -572,7 +590,8 @@ def _param_info(param) -> ParamInfo:
         )
     return ParamInfo(
         kind=kind,
-        cli_keys=_cli_keys_for_kind(kind),
+        cli_keys=cli_keys,
+        settable=settable,
         default=param.default,
         default_hex=None,
         choices=(),

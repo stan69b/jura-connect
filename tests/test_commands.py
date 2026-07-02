@@ -774,6 +774,41 @@ def test_products_without_profile_is_refused(sim) -> None:
         c.close()
 
 
+def test_products_renders_non_overridable_param_read_only(sim) -> None:
+    """A param with no `brew` CLI alias (milk_amount on the S8/EF1091)
+    must render under its kind name with a read-only annotation — never
+    a blank key column — and expose settable=False in to_dict()."""
+    c = _paired_with_profile(sim, "EF1091")
+    try:
+        cat = run_named(c, "products", [], timeout=1.0).value
+        milk = next(p for p in cat.products if p.name == "milk")  # 0x0A
+        amount = next(pp for pp in milk.params if pp.kind == "milk_amount")
+        # No CLI alias -> not settable via `brew`.
+        assert amount.cli_keys == ()
+        assert amount.settable is False
+        # The rendered row uses the kind name, not a blank column, and
+        # is annotated read-only.
+        row = amount.format()
+        assert row.split("default")[0].strip() == "milk_amount"
+        assert "read-only: not settable via 'brew'" in row
+        assert not row.startswith("     default")  # no empty key column
+        # Whole-product format shows it too.
+        assert "milk_amount" in milk.format()
+        assert "read-only" in milk.format()
+        # Structured output carries settable=False for this param.
+        d = milk.to_dict()
+        entry = next(pp for pp in d["params"] if pp["kind"] == "milk_amount")
+        assert entry["settable"] is False
+        assert entry["cli_keys"] == []
+        # A settable param (strength) still reports settable=True.
+        espresso = next(p for p in cat.products if p.name == "espresso")
+        strength = next(pp for pp in espresso.params if pp.kind == "coffee_strength")
+        assert strength.settable is True
+        assert strength.to_dict()["settable"] is True
+    finally:
+        c.close()
+
+
 def test_set_pin_validates_numeric(sim) -> None:
     c = _paired(sim)
     try:
