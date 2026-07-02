@@ -19,7 +19,7 @@ APK. Layered as:
 * :mod:`jura_connect.credentials` -- JSON file storage of pairing secrets.
 """
 
-__version__ = "0.9.4"
+__version__ = "0.10.0"
 
 from .client import (
     PRODUCT_NAMES,
@@ -38,6 +38,13 @@ from .client import (
     SettingValue,
 )
 from .profile import (
+    KIND_BYPASS,
+    KIND_COFFEE_STRENGTH,
+    KIND_MILK_BREAK,
+    KIND_MILK_FOAM_AMOUNT,
+    KIND_TEMPERATURE,
+    KIND_WATER_AMOUNT,
+    RECIPE_PARAM_KINDS,
     AlertDef,
     MachineCatalogueEntry,
     MachineProfile,
@@ -70,6 +77,13 @@ from .discovery import Machine, discover, probe, scan_tcp, tcp_probe
 __all__ = [
     "AlertDef",
     "COMMANDS",
+    "KIND_BYPASS",
+    "KIND_COFFEE_STRENGTH",
+    "KIND_MILK_BREAK",
+    "KIND_MILK_FOAM_AMOUNT",
+    "KIND_TEMPERATURE",
+    "KIND_WATER_AMOUNT",
+    "RECIPE_PARAM_KINDS",
     "CommandError",
     "CommandResult",
     "CommandSpec",

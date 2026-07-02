@@ -133,7 +133,7 @@ available commands:
 
   destructive (require --allow-destructive-commands; see 'jura-connect command --help'):
     clean                    [destructive] start coffee-system cleaning cycle (@TG:24)
-    decalc                   [destructive] start descaling cycle (@TG:25)
+    descale                   [destructive] start descaling cycle (@TG:25)
     filter-change            [destructive] run water-filter change procedure (@TG:26)
     cappu-clean              [destructive] start cappuccino-system cleaning (@TG:21)
     cappu-rinse              [destructive] rinse the milk system (@TG:23)
@@ -161,12 +161,12 @@ handshake -> CORRECT  (@hp4)
   errors         : (none)
   info flags     : coffee_ready, energy_safe
   process flags  : (none)
-  maintenance    : cleaning=21 filter=1 decalc=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
-  maintenance %  : cleaning=80 filter=255 decalc=30
+  maintenance    : cleaning=21 filter=1 descale=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
+  maintenance %  : cleaning=80 filter=255 descale=30
 
 $ jura-connect command --name Kaffeebert counters
 handshake -> CORRECT  (@hp4)
-cleaning=21 filter=1 decalc=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
+cleaning=21 filter=1 descale=8 cappu_rinse=344 coffee_rinse=3617 cappu_clean=91
 
 $ jura-connect command --name Kaffeebert status
 handshake -> CORRECT  (@hp4)
@@ -200,7 +200,7 @@ Status output distinguishes blocking **errors** (machine is stuck,
 user must act) from **info** flags (low-supply reminders and
 state-of-being bits such as `no_beans`, `coffee_ready`,
 `energy_safe`) and **process** flags (periodic maintenance prompts
-such as `cleaning_alert` and `decalc_alert`). The unsplit
+such as `cleaning_alert` and `descale_alert`). The unsplit
 ``active_alerts`` is still on the dataclass for backwards
 compatibility.
 
@@ -289,7 +289,7 @@ $ jura-connect command --name Kaffeebert --json counters | jq .
   "value": {
     "cleaning": 21,
     "filter_change": 1,
-    "decalc": 8,
+    "descale": 8,
     "cappu_rinse": 344,
     "coffee_rinse": 3617,
     "cappu_clean": 91,
@@ -308,11 +308,17 @@ structured result type — `MaintenanceCounters`, `MaintenancePercent`,
 
 ### Brew a product (`brew`)
 
-`brew` starts a product by its profile name (substring match OK), by
-its 2-hex product code, or — as an escape hatch — by a full verbatim
-recipe blob. Optional `param=value` arguments override the machine
-XML's defaults; every value is validated against the XML catalogue
-(range, step, allowed items) before anything goes on the wire:
+`brew` starts a product by its 2-hex product code, by its profile
+name, or — as an escape hatch — by a full verbatim recipe blob (32+
+hex chars). Name resolution is: an exact 2-hex code first, then an
+exact snake_case name, then an unambiguous name *prefix* (so
+`hotwater` finds `hotwater_portion_normal` but `esp` is rejected as
+ambiguous). Pass `substring=True` to `JuraClient.resolve_product` /
+`brew` to widen matching to anywhere in the name. Optional
+`param=value` arguments (an uncapped variadic list) override the
+machine XML's defaults; every value is validated against the XML
+catalogue (range, step, allowed items) before anything goes on the
+wire:
 
 ```sh
 # Hot water with the XML default quantity (here: 220 ml)
@@ -339,6 +345,12 @@ Parameter keys: `water`/`ml` (millilitres), `strength` (level),
 `temp`/`temperature` (`low` / `normal` / `high`), `milk` (seconds),
 `milk_break` (seconds), `bypass` (millilitres). Which parameters a
 product accepts comes from its machine-XML entry.
+
+> **Bypass and milk overrides are not live-verified — they may
+> misbrew, so verify them on your hardware.** `bypass`, `milk`
+> (milk-foam) and `milk_break` are encoded from the XML (ml kinds ÷5
+> ticks, seconds as-is) but have not been confirmed against a physical
+> machine. Only water and temperature are live-verified.
 
 The wire command is **not** a bare product code: TT237W-family WiFi
 firmware ACKs `@TP:0D` with `@tp` and then silently ignores it. The
@@ -450,7 +462,7 @@ with JuraClient(creds.address, conn_id=creds.conn_id,
     for spec in list_commands():
         print(spec.usage(), "—", spec.description)
     result = run_named(c, "counters")
-    print(result.format())             # cleaning=21 filter=1 decalc=8 …
+    print(result.format())             # cleaning=21 filter=1 descale=8 …
 ```
 
 ## Tests, lint, and type-check

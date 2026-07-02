@@ -4,7 +4,17 @@ All notable changes to `jura-connect` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.10.0] — 2026-07-02
+
+### Changed (breaking)
+- **`decalc` renamed to `descale` across the whole API.** The CLI
+  command is now `descale` (was `decalc`), the maintenance-counter
+  attribute/dict-key is `MaintenanceCounters.descale` /
+  `MaintenancePercent.descale` (was `.decalc`), and the derived alert
+  name is `descale_alert` (was `decalc_alert`). Consumers (the Home
+  Assistant component) must update `run_named("descale")`, `.descale`,
+  and the `descale_alert` name. The wire command (`@TG:25`) and the
+  bundled machine XMLs are unchanged.
 
 ### Fixed
 - **Brewing actually brews now.** ``brew`` used to send the bare
@@ -19,25 +29,51 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   which the WiFi blob doesn't carry). Water travels as 5 ml ticks;
   an unset water byte means 255 ticks ≈ 1.275 litres, so the blob is
   always sent in full. See §5.9 of ``docs/PROTOCOL.md``.
+- **Flood-guard on the recipe blob.** `build_recipe_hex` now *raises*
+  when a water/ml parameter the product has would be left unset (no
+  override and no XML default) instead of shipping its ``FF`` byte
+  (255 ticks ≈ 1.3 l). Range/step validation also defaults a missing
+  XML ``Min`` to ``0`` rather than silently skipping the check.
+- **Active-default-true products restored.** Products with no
+  ``Active`` XML attribute (Milk Foam, Cafe Barista, Barista Lungo on
+  the E6, and menu items on ~42 other models) are brewable — J.O.E.
+  defaults the flag true and only hides ``Active="false"`` entries.
+  Such inactive entries stay in the catalogue (the machine still
+  reports their counters) but are marked ``ProductDef.active = False``
+  so a UI can hide them.
 
 ### Added
 - **Recipe parameters parsed from the machine XMLs.**
-  :class:`ProductDef` now carries the product's recipe parameters
+  `ProductDef` now carries the product's recipe parameters
   (water amount, coffee strength, temperature, milk foam, bypass,
-  milk break) as :class:`ProductParam` entries — XML units, ranges,
+  milk break) as `ProductParam` entries — XML units, ranges,
   steps, and ITEM catalogues included —
-  and :meth:`ProductDef.build_recipe_hex` builds the validated
-  16-byte ``@TP:`` blob from them.
-- **:meth:`JuraClient.brew`** — brew by product name or code with
+  and `ProductDef.build_recipe_hex` builds the validated
+  16-byte ``@TP:`` blob from them. The public recipe-parameter kind
+  identifiers are exported as `KIND_WATER_AMOUNT`,
+  `KIND_COFFEE_STRENGTH`, `KIND_TEMPERATURE`, `KIND_MILK_FOAM_AMOUNT`,
+  `KIND_MILK_BREAK`, `KIND_BYPASS` and the `RECIPE_PARAM_KINDS` tuple,
+  so consumers build override dicts without hard-coding strings.
+- **`JuraClient.brew`** — brew by product name or code with
   keyword overrides: ``client.brew("hotwater", ml=220)``,
   ``client.brew("espresso", strength=7, temperature="high")``.
-  Product names resolve like settings do (exact snake_case first,
-  then unambiguous substring). Values are validated against the
-  machine XML before anything goes on the wire.
+  Product names resolve by exact 2-hex code first, then exact
+  snake_case name, then an unambiguous name *prefix* (pass
+  ``substring=True`` to widen). An opt-in ``retry=True`` resends the
+  blob once if the first reply isn't an ``@tp`` accept (energy-safe
+  wake-up, PROTOCOL.md §5.9). Values are validated against the machine
+  XML before anything goes on the wire.
 - **CLI: ``brew <product> [param=value …]``** — e.g.
-  ``brew hotwater water=220 temp=high``. Accepts a profile product
-  name, a 2-hex product code, or a full recipe blob verbatim as an
-  escape hatch. Out-of-catalogue values are refused client-side.
+  ``brew hotwater water=220 temp=high``. The override argument is a
+  real variadic (uncapped, shown in ``--help``); it accepts a profile
+  product name, a 2-hex product code, or a full 32-hex recipe blob
+  verbatim as an escape hatch. Out-of-catalogue values are refused
+  client-side.
+- **Bypass and milk overrides** (`bypass`, `milk_foam`, `milk_break`)
+  are accepted by `build_recipe_hex`, `JuraClient.brew` and the CLI.
+  **Not live-verified — may misbrew, verify on your hardware.** They
+  are encoded from the XML (ml kinds ÷5 ticks, seconds as-is); only
+  water and temperature are confirmed against a physical machine.
 
 ## [0.9.4] — 2026-05-12
 
@@ -50,47 +86,47 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   has no name for. The CLI was safe because ``_r_setting`` runs the
   value through ``SettingDef.normalise_value`` first; only library
   callers were exposed. ``write_setting`` now validates against the
-  loaded :class:`MachineProfile`'s :class:`SettingDef` (when a
-  profile is set) and raises :class:`ValueError` before the request
+  loaded `MachineProfile`'s `SettingDef` (when a
+  profile is set) and raises `ValueError` before the request
   hits the wire. ITEM names like ``"30min"`` are also accepted as a
   convenience, so ``client.write_setting("13", "30min")`` now works
   the same way the CLI does.
 
 ### Added
-- **Name-based settings API on :class:`JuraClient`.** Three new
+- **Name-based settings API on `JuraClient`.** Three new
   methods that use snake_case setting names (``"auto_off"``,
   ``"hardness"``, ``"language"``) and named ITEM values
   (``"30min"``, ``"english"``) end-to-end:
 
-  * :meth:`JuraClient.get_setting(name)` — returns a
-    :class:`SettingValue` with both the raw wire hex (``"1E"``) and
+  * `JuraClient.get_setting(name)` — returns a
+    `SettingValue` with both the raw wire hex (``"1E"``) and
     the resolved ITEM name (``"30min"``), plus the underlying
-    :class:`SettingDef` for further inspection.
-  * :meth:`JuraClient.set_setting(name, value)` — value accepts an
+    `SettingDef` for further inspection.
+  * `JuraClient.set_setting(name, value)` — value accepts an
     ITEM name (``"30min"``), a wire-format hex string (``"211E"``),
     or for step-sliders a hex integer in range. Raises
-    :class:`ValueError` for anything else before the request hits
+    `ValueError` for anything else before the request hits
     the wire.
-  * :meth:`JuraClient.list_settings()` — returns the full
-    :class:`SettingDef` catalogue from the loaded profile so
+  * `JuraClient.list_settings()` — returns the full
+    `SettingDef` catalogue from the loaded profile so
     callers can enumerate writable settings and their allowed
     ITEM values from a script or REPL.
 
-  All three require a :class:`MachineProfile` to be loaded on the
+  All three require a `MachineProfile` to be loaded on the
   client (pass ``profile=load_profile("EFxxxx")`` or use the CLI's
   ``--machine-type`` / stored credential).
-- :meth:`SettingDef.validate_wire_hex` — hex-form variant of
+- `SettingDef.validate_wire_hex` — hex-form variant of
   ``normalise_value`` for the library write path (step-slider input
   parsed as hex with range / step check; ITEM-driven kinds must match
   a catalogue value exactly). The pre-existing ``normalise_value``
   is unchanged — it still parses step-slider input as decimal for
   the CLI.
-- :meth:`SettingDef.item_from_hex` — resolve a read-back hex value
+- `SettingDef.item_from_hex` — resolve a read-back hex value
   to its catalogue ITEM (exact match, falling back to suffix-match
   for AutoOFF's stripped readback form).
-- :meth:`MachineProfile.setting_by_arg` — look up a setting by its
+- `MachineProfile.setting_by_arg` — look up a setting by its
   ``P_Argument`` hex code (e.g. ``"13"`` for AutoOFF).
-- :class:`jura_connect.SettingValue` dataclass returned by
+- `jura_connect.SettingValue` dataclass returned by
   ``get_setting``; re-exported from the top-level package.
 
 ## [0.9.3] — 2026-05-12
@@ -138,7 +174,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   in ``apk_unpacked/smali_classes2/k8/c.smali:367``); the Python
   port now does the same. Defence in depth:
   ``JuraClient.write_setting(..., verify=True)`` reads the value
-  back after the unlock and raises :class:`ValueError` if the
+  back after the unlock and raises `ValueError` if the
   stored value doesn't match what was sent, so the silent-drop
   failure mode can never look like a successful write again.
 
@@ -166,7 +202,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   (``(1 << (7 - i%8)) & bArr[i/8]``). On Kaffeebert's idle frame
   ``@TF:0004000008000000`` the prior code reported ``no_beans`` +
   ``cappu_rinse_alert``; the real meaning is ``coffee_ready`` +
-  ``energy_safe``. Every named bit in :data:`_STATUS_BITS` and every
+  ``energy_safe``. Every named bit in `_STATUS_BITS` and every
   per-machine ``AlertDef.bit`` was already correct — only the
   ``MachineStatus.parse`` byte/bit extraction was wrong.
 
@@ -299,7 +335,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   informational bits as active errors. `no_beans` on the S8 EB is
   `Type="info"` (bean bin low, not blocked) and now appears under
   ``info flags``, not under ``errors``. Same correction for the
-  periodic maintenance prompts (`filter_alert`, `decalc_alert`,
+  periodic maintenance prompts (`filter_alert`, `descale_alert`,
   `cleaning_alert`, `cappu_rinse_alert`), which surface under
   ``process flags``.
 - The `@TR:32` "known unknown" entry in `docs/PROTOCOL.md` is removed
@@ -383,7 +419,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 - Destructive command names are now part of the registry and reachable
-  by name: `clean`, `decalc`, `filter-change`, `cappu-clean`,
+  by name: `clean`, `descale`, `filter-change`, `cappu-clean`,
   `cappu-rinse`, `reset-counters`, `restart`, `power-off`,
   `brew <recipe>`, `set-pin <pin>`, `set-ssid <ssid>`,
   `set-password <pwd>`, `set-name <name>`.

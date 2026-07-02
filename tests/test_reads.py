@@ -31,7 +31,7 @@ def test_maintenance_counters(sim) -> None:
     # Defaults straight out of the simulator config (mirror Kaffeebert).
     assert mc.cleaning == 0x0015
     assert mc.filter_change == 0x0001
-    assert mc.decalc == 0x0008
+    assert mc.descale == 0x0008
     assert mc.cappu_rinse == 0x0158
     assert mc.coffee_rinse == 0x0E21
     assert mc.cappu_clean == 0x005B
@@ -46,7 +46,7 @@ def test_maintenance_percent(sim) -> None:
         c.close()
     assert mp.cleaning == 0x50
     assert mp.filter_change == 0xFF
-    assert mp.decalc == 0x1E
+    assert mp.descale == 0x1E
 
 
 def test_status_alerts(sim) -> None:

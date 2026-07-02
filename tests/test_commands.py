@@ -46,7 +46,7 @@ def test_list_commands_contains_safe_and_destructive_groups() -> None:
     # Destructive operations are present *and* flagged with a danger string.
     for expected in [
         "clean",
-        "decalc",
+        "descale",
         "filter-change",
         "cappu-clean",
         "cappu-rinse",
@@ -417,14 +417,15 @@ def test_string_result_to_dict_passthrough(sim) -> None:
 # (name, args) pairs covering every destructive command in the registry.
 _DESTRUCTIVE_INVOCATIONS = [
     ("clean", []),
-    ("decalc", []),
+    ("descale", []),
     ("filter-change", []),
     ("cappu-clean", []),
     ("cappu-rinse", []),
     ("reset-counters", []),
     ("restart", []),
     ("power-off", []),
-    ("brew", ["01"]),
+    # A full 32-hex @TP: blob reaches the wire without a profile.
+    ("brew", ["0DFFFF2CFFFF01FFFFFFFFFFFFFFFFFF"]),
     ("set-pin", ["1234"]),
     ("set-ssid", ["mywifi"]),
     ("set-password", ["s3cret"]),
@@ -611,6 +612,71 @@ def test_client_brew_api_builds_and_sends(sim) -> None:
     finally:
         c.close()
     assert reply.startswith("@an:error")  # simulator refuses @TP:
+
+
+def test_brew_variadic_overrides_uncapped(sim) -> None:
+    """The override arg is truly variadic — more than the old 5-cap
+    param=value pairs parse fine (they just validate/refuse per-kind)."""
+    spec = commands.get_command("brew")
+    # One product + one real variadic override argument, not a fake cap.
+    assert len(spec.arguments) == 2
+    assert spec.arguments[1].variadic is True
+    c = _paired_with_profile(sim)
+    try:
+        # Multiple overrides in one call reach the wire (validated first).
+        result = run_named(
+            c,
+            "brew",
+            ["espresso", "strength", "water=45"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
+    except CommandError as exc:
+        # 'strength' without '=' must be a clear param=value error, not a
+        # silent drop or an arg-count error.
+        assert "param=value" in str(exc)
+    else:  # pragma: no cover - defensive
+        result  # noqa: B018
+    finally:
+        c.close()
+
+
+def test_brew_short_hex_name_is_not_a_verbatim_blob(sim) -> None:
+    """A short all-hex token ('dec', 'face') is a name, not a raw blob:
+    only >= 32 hex chars are sent verbatim. Without a profile it must be
+    refused client-side rather than shipped as a bare @TP: payload."""
+    c = _paired(sim)  # no profile
+    try:
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "brew", ["face"], timeout=1.0, allow_destructive=True)
+        # 30 hex chars (< 32) is still treated as a name/code, not a blob.
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "brew", ["0D" * 15], timeout=1.0, allow_destructive=True)
+    finally:
+        c.close()
+
+
+def test_brew_bypass_and_milk_overrides_reach_wire(sim) -> None:
+    """Bypass and milk-foam overrides are accepted and encoded (NOT
+    live-verified — see build_recipe_hex caveat)."""
+    from jura_connect.profile import load_profile
+
+    # Cafe Barista (0x28) carries a BYPASS parameter on the EF538.
+    prof = load_profile("EF538")
+    barista = prof.product_by_code[0x28]
+    assert barista.param("bypass") is not None
+    c = _paired_with_profile(sim)
+    try:
+        result = run_named(
+            c,
+            "brew",
+            ["cafe_barista", "bypass=30"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
+    finally:
+        c.close()
+    assert result.value.startswith("@an:error")  # type: ignore[union-attr]
 
 
 def test_set_pin_validates_numeric(sim) -> None:

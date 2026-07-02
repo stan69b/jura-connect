@@ -10,7 +10,7 @@ The registry is split into two tiers:
 * **Read-only commands** (``info``, ``counters``, ``status``, …) — safe
   to invoke at any time. The CLI lets these through unconditionally.
 
-* **Destructive commands** (``clean``, ``decalc``, ``set-pin``, …) —
+* **Destructive commands** (``clean``, ``descale``, ``set-pin``, …) —
   these change the machine's physical state, consume supplies, can
   lock you out of the dongle (wrong PIN / WiFi credentials), or kick
   off long-running cycles you cannot abort remotely. They are gated
@@ -31,7 +31,9 @@ import dataclasses
 import re
 from collections.abc import Callable, Sequence
 
+from . import profile
 from .client import JuraClient
+from .profile import RECIPE_BLOB_BYTES
 
 CommandRunner = Callable[["CommandSpec", JuraClient, "tuple[str, ...]", float], object]
 
@@ -43,7 +45,7 @@ DESTRUCTIVE_PREFIXES: tuple[bytes, ...] = (
     b"@TG:21",  # CappuClean
     b"@TG:23",  # CappuRinse
     b"@TG:24",  # Cleaning
-    b"@TG:25",  # Decalc
+    b"@TG:25",  # Descale
     b"@TG:26",  # FilterChange
     b"@TG:7E",  # reset maintenance counter (with or without arg)
     b"@TG:FF",  # reset (broad)
@@ -70,11 +72,17 @@ class DestructiveCommandError(CommandError):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class Argument:
-    """One positional argument accepted by a :class:`CommandSpec`."""
+    """One positional argument accepted by a :class:`CommandSpec`.
+
+    ``variadic=True`` marks a trailing argument that soaks up zero or
+    more values (like ``nargs="*"``). It must be the last argument in a
+    :class:`CommandSpec`, and implies ``optional``.
+    """
 
     name: str
     help: str
     optional: bool = False  # if True, the arg may be omitted on the CLI
+    variadic: bool = False  # if True, soaks up all remaining values
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -101,9 +109,14 @@ class CommandSpec:
     def usage(self) -> str:
         if not self.arguments:
             return self.name
-        parts = [
-            f"[<{a.name}>]" if a.optional else f"<{a.name}>" for a in self.arguments
-        ]
+        parts = []
+        for a in self.arguments:
+            if a.variadic:
+                parts.append(f"[<{a.name}>...]")
+            elif a.optional:
+                parts.append(f"[<{a.name}>]")
+            else:
+                parts.append(f"<{a.name}>")
         return f"{self.name} " + " ".join(parts)
 
     def run(
@@ -114,14 +127,20 @@ class CommandSpec:
         timeout: float,
         allow_destructive: bool = False,
     ) -> CommandResult:
-        required = sum(1 for a in self.arguments if not a.optional)
-        if not required <= len(args) <= len(self.arguments):
+        required = sum(1 for a in self.arguments if not a.optional and not a.variadic)
+        has_variadic = any(a.variadic for a in self.arguments)
+        upper = float("inf") if has_variadic else len(self.arguments)
+        if not required <= len(args) <= upper:
             expected_summary = (
-                ", ".join(a.name + ("?" if a.optional else "") for a in self.arguments)
+                ", ".join(
+                    a.name + ("..." if a.variadic else "?" if a.optional else "")
+                    for a in self.arguments
+                )
                 or "none"
             )
+            upper_txt = "∞" if has_variadic else str(len(self.arguments))
             raise CommandError(
-                f"{self.name}: expected {required}..{len(self.arguments)} "
+                f"{self.name}: expected {required}..{upper_txt} "
                 f"argument(s) ({expected_summary}); got {len(args)}"
             )
 
@@ -287,7 +306,7 @@ def _r_clean(_spec, client, _args, timeout):
     return client.request("@TG:24", timeout=timeout)
 
 
-def _r_decalc(_spec, client, _args, timeout):
+def _r_descale(_spec, client, _args, timeout):
     return client.request("@TG:25", timeout=timeout)
 
 
@@ -315,32 +334,36 @@ def _r_power_off(_spec, client, _args, timeout):
     return _request_or_disconnect(client, "@AN:02", timeout, "machine powering off")
 
 
-# CLI key -> recipe-parameter kind (the snake_case XML tag). Friendly
-# short forms first; the full kind names work too.
-_BREW_KEY_TO_KIND = {
-    "water": "water_amount",
-    "ml": "water_amount",
-    "water_amount": "water_amount",
-    "strength": "coffee_strength",
-    "coffee_strength": "coffee_strength",
-    "temp": "temperature",
-    "temperature": "temperature",
-    "milk": "milk_foam_amount",
-    "milk_foam": "milk_foam_amount",
-    "milk_foam_amount": "milk_foam_amount",
-    "milk_break": "milk_break",
-    "bypass": "bypass",
+# CLI override alias -> recipe-parameter kind. Two tiers so the help
+# text (built from _BREW_KEY_ALIASES) doesn't leak the canonical kind
+# names as duplicate keys: friendly aliases first, then every canonical
+# kind maps to itself so the full name works too.
+_BREW_KEY_ALIASES = {
+    "water": profile.KIND_WATER_AMOUNT,
+    "ml": profile.KIND_WATER_AMOUNT,
+    "strength": profile.KIND_COFFEE_STRENGTH,
+    "temp": profile.KIND_TEMPERATURE,
+    "milk": profile.KIND_MILK_FOAM_AMOUNT,
+    "milk_foam": profile.KIND_MILK_FOAM_AMOUNT,
 }
+_BREW_KEY_TO_KIND = {
+    **_BREW_KEY_ALIASES,
+    **{kind: kind for kind in profile.RECIPE_PARAM_KINDS},
+}
+
+#: A full verbatim recipe blob is 16 bytes = 32 hex chars. Only treat
+#: input of at least this length as a raw blob, so short product names
+#: that happen to be all-hex ("dec", "feed", "face") stay names.
+_VERBATIM_BLOB_MIN_HEX = RECIPE_BLOB_BYTES * 2
 
 
 def _r_brew(_spec, client, args, timeout):
     """Start a product. Three input forms for ``<product>``:
 
     * a product name from the machine profile (``espresso``,
-      ``hotwater`` — unambiguous substrings OK) — requires a profile;
-    * a 2-hex product code (``0D``) — resolved against the profile
-      when present, else sent verbatim (legacy behaviour);
-    * a full recipe blob (4+ hex chars) — sent verbatim, escape hatch
+      ``hotwater`` — unambiguous prefixes OK) — requires a profile;
+    * a 2-hex product code (``0D``) — resolved against the profile;
+    * a full recipe blob (32+ hex chars) — sent verbatim, escape hatch
       for firmware variants with a different layout.
 
     Optional ``param=value`` args override the XML defaults, e.g.
@@ -357,13 +380,18 @@ def _r_brew(_spec, client, args, timeout):
             )
         kind = _BREW_KEY_TO_KIND.get(key.strip().lower())
         if kind is None:
-            known = ", ".join(sorted(set(_BREW_KEY_TO_KIND)))
+            known = ", ".join(sorted(_BREW_KEY_TO_KIND))
             raise CommandError(f"brew: unknown parameter {key!r}. Known: {known}")
         overrides[kind] = value.strip()
 
-    is_hex = bool(re.fullmatch(r"[0-9A-Fa-f]+", target)) and len(target) % 2 == 0
-    if is_hex and len(target) > 2:
-        # Full recipe blob: trust the caller, send verbatim.
+    # A full recipe blob (>= 32 hex chars, even length) is trusted and
+    # sent verbatim. Shorter all-hex strings are product codes/names.
+    is_blob = (
+        bool(re.fullmatch(r"[0-9A-Fa-f]+", target))
+        and len(target) % 2 == 0
+        and len(target) >= _VERBATIM_BLOB_MIN_HEX
+    )
+    if is_blob:
         if overrides:
             raise CommandError(
                 "brew: param=value overrides cannot be combined with a "
@@ -371,15 +399,11 @@ def _r_brew(_spec, client, args, timeout):
             )
         return client.request(f"@TP:{target}", timeout=timeout)
     if client.profile is None:
-        if is_hex:
-            # Legacy escape hatch: no profile to build a blob from.
-            # NB on TT237W-family WiFi firmware a bare product code is
-            # ACK'd but ignored; pair with --machine-type to get blobs.
-            return client.request(f"@TP:{target}", timeout=timeout)
         raise CommandError(
-            "brew: product names need a machine profile. Pair with "
-            "--machine-type <EF_code> (or pass --machine-type to "
-            "'command'); see 'jura-connect machine-types'."
+            "brew: product names and codes need a machine profile. Pair "
+            "with --machine-type <EF_code> (or pass --machine-type to "
+            "'command'); see 'jura-connect machine-types'. A full 32-hex "
+            "recipe blob is accepted without a profile as an escape hatch."
         )
     try:
         definition = client.resolve_product(target)
@@ -619,10 +643,10 @@ _SPECS: tuple[CommandSpec, ...] = (
         ),
     ),
     CommandSpec(
-        name="decalc",
+        name="descale",
         description="[destructive] start descaling cycle (@TG:25)",
         arguments=(),
-        runner=_r_decalc,
+        runner=_r_descale,
         destructive=True,
         danger=(
             "starts a real descaling cycle (30+ min). The machine expects "
@@ -672,7 +696,7 @@ _SPECS: tuple[CommandSpec, ...] = (
         destructive=True,
         danger=(
             "irreversibly resets every maintenance counter (cleaning / "
-            "decalc / filter / etc.) to zero. The machine will then "
+            "descale / filter / etc.) to zero. The machine will then "
             "'forget' when it was last serviced. There is no undo."
         ),
     ),
@@ -711,8 +735,8 @@ _SPECS: tuple[CommandSpec, ...] = (
         arguments=(
             Argument(
                 "product",
-                "profile product name ('espresso', 'hotwater'…; substring "
-                "OK), 2-hex product code, or a full recipe blob",
+                "profile product name ('espresso', 'hotwater'…; prefix "
+                "OK), 2-hex product code, or a full recipe blob (32+ hex)",
             ),
             Argument(
                 "param=value",
@@ -720,12 +744,8 @@ _SPECS: tuple[CommandSpec, ...] = (
                 "temp=<low|normal|high> milk=<s> milk_break=<s> "
                 "bypass=<ml>; defaults come from the machine XML",
                 optional=True,
+                variadic=True,
             ),
-            Argument("param=value", "additional override", optional=True),
-            Argument("param=value", "additional override", optional=True),
-            Argument("param=value", "additional override", optional=True),
-            Argument("param=value", "additional override", optional=True),
-            Argument("param=value", "additional override", optional=True),
         ),
         runner=_r_brew,
         destructive=True,

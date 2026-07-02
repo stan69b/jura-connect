@@ -149,6 +149,129 @@ def test_build_recipe_hex_validates_against_catalogue():
         hot_water.build_recipe_hex({"coffee_strength": 5})  # no grounds in water
 
 
+def test_active_default_true_keeps_products_without_active_attribute():
+    """J.O.E. defaults Active to true; only Active="false" is hidden.
+
+    On the EF538 (E8 (EB)) Milk Foam, Cafe Barista and Barista Lungo
+    carry no Active attribute and must stay brewable. Products flagged
+    Active="false" (internal Powderproduct) stay in the catalogue — the
+    machine still reports their counters — but are marked inactive so a
+    UI can hide them."""
+    p = load_profile("EF538")
+    assert p.product_by_code[0x08].name == "milk_foam"  # no Active attr
+    assert p.product_by_code[0x08].active is True
+    assert p.product_by_code[0x28].name == "cafe_barista"  # no Active attr
+    assert p.product_by_code[0x28].active is True
+    assert p.product_by_code[0x29].name == "barista_lungo"  # no Active attr
+    assert p.product_by_code[0x29].active is True
+    # Powderproduct is Active="false": present for counters, but inactive.
+    assert p.product_by_code[0x0F].name == "powderproduct"
+    assert p.product_by_code[0x0F].active is False
+
+
+def test_build_recipe_hex_flood_guard_on_missing_ml_value():
+    """A water/ml parameter with no override and no XML default must be
+    refused, never left at FF (=255 ticks ≈ 1.3 l flood)."""
+    from jura_connect.profile import ProductDef, ProductParam
+
+    # Synthetic product with a WATER_AMOUNT param that has NO default.
+    water = ProductParam(
+        kind="water_amount",
+        argument=4,
+        default=None,
+        minimum=25,
+        maximum=450,
+        step=5,
+        items=(),
+    )
+    prod = ProductDef(
+        code=0x02, name="synthetic", raw_name="Synthetic", params=(water,)
+    )
+    with pytest.raises(ValueError, match="refusing to leave"):
+        prod.build_recipe_hex()
+    # An explicit amount is fine.
+    assert prod.build_recipe_hex({"water_amount": 100}).startswith("02")
+
+
+def test_build_recipe_hex_encodes_bypass_and_milk_foam_defaults():
+    """Bypass (F10, ml ÷5 ticks) and milk-foam (F6, seconds) defaults
+    from the XML are baked into the blob (NOT live-verified)."""
+    p = load_profile("EF538")
+    # Cafe Barista: BYPASS F10 (offset 9) default 45 ml -> 9 ticks = 0x09.
+    barista = p.product_by_code[0x28]
+    blob = barista.build_recipe_hex()
+    assert blob[9 * 2 : 9 * 2 + 2] == "09"
+    # Override in ml is validated + divided into 5 ml ticks.
+    assert barista.build_recipe_hex({"bypass": 30})[9 * 2 : 9 * 2 + 2] == "06"
+    # Milk Foam: MILK_FOAM_AMOUNT F6 (offset 5) default 22 s -> 0x16.
+    milk_foam = p.product_by_code[0x08]
+    assert milk_foam.build_recipe_hex()[5 * 2 : 5 * 2 + 2] == "16"
+
+
+def test_build_recipe_hex_byte_math_matches_e6_style_layout():
+    """The E6-family live vectors use a 00-padded layout with a byte-8
+    flag that this FF-fill builder does not emit; assert the *byte math*
+    (offsets F-1, water ÷5 ticks, temperature ITEM values) that the
+    builder does guarantee, via a synthetic ProductDef.
+
+    NOTE: the two hardware vectors 02000809000002000100000000000000
+    (Espresso) and 0300021A000001000100000000000000 (Coffee, str 2,
+    130 ml, Normal) are 00-padded and set byte 8 = 01, which differs
+    from the FF-padded EF538/E8 blob this library builds. They are a
+    firmware-family variation to be verified on hardware; only the
+    positions/scaling below are asserted here."""
+    from jura_connect.profile import ProductDef, ProductParam, SettingItem
+
+    strength = ProductParam(
+        kind="coffee_strength",
+        argument=3,
+        default=2,
+        minimum=None,
+        maximum=None,
+        step=None,
+        items=(
+            SettingItem(name="1", raw_name="1", value="01"),
+            SettingItem(name="2", raw_name="2", value="02"),
+        ),
+    )
+    water = ProductParam(
+        kind="water_amount",
+        argument=4,
+        default=130,
+        minimum=15,
+        maximum=250,
+        step=5,
+        items=(),
+    )
+    temp = ProductParam(
+        kind="temperature",
+        argument=7,
+        default=1,
+        minimum=None,
+        maximum=None,
+        step=None,
+        items=(
+            SettingItem(name="normal", raw_name="Normal", value="01"),
+            SettingItem(name="high", raw_name="High", value="02"),
+        ),
+    )
+    coffee = ProductDef(
+        code=0x03,
+        name="coffee",
+        raw_name="Coffee",
+        params=(strength, water, temp),
+    )
+    blob = coffee.build_recipe_hex(
+        {"coffee_strength": 2, "water_amount": 130, "temperature": "normal"}
+    )
+    # Product code at byte 0, strength at F3->byte2, water 130ml/5=26=1A
+    # at F4->byte3, temperature Normal=01 at F7->byte6.
+    assert blob[0:2] == "03"
+    assert blob[2 * 2 : 2 * 2 + 2] == "02"
+    assert blob[3 * 2 : 3 * 2 + 2] == "1A"
+    assert blob[6 * 2 : 6 * 2 + 2] == "01"
+
+
 def test_parse_xml_handles_default_namespace():
     """The Jura XMLs use a default namespace; the loader must strip it."""
     text = """<?xml version="1.0"?>
