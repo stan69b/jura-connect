@@ -657,26 +657,56 @@ def test_brew_short_hex_name_is_not_a_verbatim_blob(sim) -> None:
 
 
 def test_brew_bypass_and_milk_overrides_reach_wire(sim) -> None:
-    """Bypass and milk-foam overrides are accepted and encoded (NOT
-    live-verified — see build_recipe_hex caveat)."""
+    """Bypass, milk-foam and milk-break overrides are accepted via the
+    CLI param=value keys, encoded onto the right blob byte, and reach
+    the wire (NOT live-verified — see build_recipe_hex caveat).
+
+    Asserts the blob byte through the CLI key->kind mapping the runner
+    uses, then confirms the same invocation reaches the wire."""
+    from jura_connect.commands import _BREW_KEY_TO_KIND
     from jura_connect.profile import load_profile
 
-    # Cafe Barista (0x28) carries a BYPASS parameter on the EF538.
     prof = load_profile("EF538")
+    # Cafe Barista (0x28) carries BYPASS (F10 -> byte 9); Latte
+    # Macchiato (0x07) carries MILK_FOAM_AMOUNT (F6 -> byte 5) and
+    # MILK_BREAK (F11 -> byte 10).
     barista = prof.product_by_code[0x28]
+    latte = prof.product_by_code[0x07]
     assert barista.param("bypass") is not None
+    assert latte.param("milk_foam_amount") is not None
+    assert latte.param("milk_break") is not None
+
+    def _blob_via_cli_keys(product, **cli_kwargs):
+        overrides = {_BREW_KEY_TO_KIND[k]: v for k, v in cli_kwargs.items()}
+        return product.build_recipe_hex(overrides)
+
+    # bypass=30 ml -> 6 ticks (0x06) at byte 9.
+    assert _blob_via_cli_keys(barista, bypass=30)[9 * 2 : 9 * 2 + 2] == "06"
+    # milk (foam) = 30 s -> 0x1E at byte 5; milk_break = 45 s -> 0x2D at byte 10.
+    latte_blob = _blob_via_cli_keys(latte, milk=30, milk_break=45)
+    assert latte_blob[5 * 2 : 5 * 2 + 2] == "1E"
+    assert latte_blob[10 * 2 : 10 * 2 + 2] == "2D"
+
     c = _paired_with_profile(sim)
     try:
-        result = run_named(
+        bypass_reply = run_named(
             c,
             "brew",
             ["cafe_barista", "bypass=30"],
             timeout=1.0,
             allow_destructive=True,
         )
+        milk_reply = run_named(
+            c,
+            "brew",
+            ["latte_macchiato", "milk=30", "milk_break=45"],
+            timeout=1.0,
+            allow_destructive=True,
+        )
     finally:
         c.close()
-    assert result.value.startswith("@an:error")  # type: ignore[union-attr]
+    assert bypass_reply.value.startswith("@an:error")  # type: ignore[union-attr]
+    assert milk_reply.value.startswith("@an:error")  # type: ignore[union-attr]
 
 
 def test_set_pin_validates_numeric(sim) -> None:

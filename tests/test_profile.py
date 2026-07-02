@@ -193,6 +193,30 @@ def test_build_recipe_hex_flood_guard_on_missing_ml_value():
     assert prod.build_recipe_hex({"water_amount": 100}).startswith("02")
 
 
+def test_build_recipe_hex_encodes_milk_foam_and_milk_break_overrides():
+    """Milk-foam (F6, seconds) and milk-break (F11, seconds) overrides
+    land on their F-1 byte, sent as-is (NOT live-verified). Latte
+    Macchiato on the EF538 carries both parameters."""
+    p = load_profile("EF538")
+    latte = p.product_by_code[0x07]
+    assert latte.param("milk_foam_amount").offset == 5  # F6
+    assert latte.param("milk_break").offset == 10  # F11
+    blob = latte.build_recipe_hex({"milk_foam_amount": 30, "milk_break": 45})
+    # Seconds are sent as-is: 30 -> 0x1E at byte 5, 45 -> 0x2D at byte 10.
+    assert blob[5 * 2 : 5 * 2 + 2] == "1E"
+    assert blob[10 * 2 : 10 * 2 + 2] == "2D"
+    # A milk_foam_amount override on a product that only has foam
+    # (Cappuccino) also lands correctly.
+    cappuccino = p.product_by_code[0x04]
+    assert cappuccino.param("milk_break") is None
+    assert cappuccino.build_recipe_hex({"milk_foam_amount": 40})[5 * 2 : 5 * 2 + 2] == (
+        "28"
+    )
+    # Out-of-range milk values are refused before the wire.
+    with pytest.raises(ValueError, match="outside"):
+        latte.build_recipe_hex({"milk_break": 99})  # Max=60
+
+
 def test_build_recipe_hex_encodes_bypass_and_milk_foam_defaults():
     """Bypass (F10, ml ÷5 ticks) and milk-foam (F6, seconds) defaults
     from the XML are baked into the blob (NOT live-verified)."""
