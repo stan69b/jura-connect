@@ -74,6 +74,7 @@ def test_list_commands_contains_safe_and_destructive_groups() -> None:
         "mem-read",
         "register-read",
         "raw",
+        "products",
     ]:
         assert not commands.get_command(safe).destructive
 
@@ -500,14 +501,6 @@ def test_safe_raw_payload_is_not_gated(sim) -> None:
 # ---- brew: recipe-blob building --------------------------------------
 
 
-def _paired_with_profile(sim) -> JuraClient:
-    from jura_connect.profile import load_profile
-
-    c = _paired(sim)
-    c.profile = load_profile("EF538")
-    return c
-
-
 def test_brew_by_name_builds_blob_and_reaches_wire(sim) -> None:
     """Named product + profile -> 16-byte blob on the wire. The
     simulator's @an:error refusal is the proof of wire contact."""
@@ -707,6 +700,78 @@ def test_brew_bypass_and_milk_overrides_reach_wire(sim) -> None:
         c.close()
     assert bypass_reply.value.startswith("@an:error")  # type: ignore[union-attr]
     assert milk_reply.value.startswith("@an:error")  # type: ignore[union-attr]
+
+
+# ---- products: brew-input discovery ----------------------------------
+
+
+def test_products_lists_brewable_products_with_allowed_values(sim) -> None:
+    """`products` reads the loaded profile (no wire I/O) and lists each
+    brewable product's resolvable name + allowed param values. The shown
+    name must be exactly what `resolve_product`/`brew` accepts."""
+    from jura_connect.commands import ParamInfo, ProductCatalogue, ProductInfo
+
+    assert not commands.get_command("products").destructive
+    c = _paired_with_profile(sim, "EF538")
+    try:
+        result = run_named(c, "products", [], timeout=1.0)
+        cat = result.value
+        assert isinstance(cat, ProductCatalogue)
+        assert cat.machine_code == "EF538"
+        latte = next(p for p in cat.products if p.name == "latte_macchiato")
+        assert isinstance(latte, ProductInfo)
+        # The listed name resolves to the same product `brew` would use.
+        assert c.resolve_product(latte.name).code == latte.code == 0x07
+        by_kind = {pp.kind: pp for pp in latte.params}
+        assert {
+            "coffee_strength",
+            "water_amount",
+            "temperature",
+            "milk_foam_amount",
+            "milk_break",
+        } <= set(by_kind)
+        # Enumerated param exposes ordered choices + friendly CLI key.
+        strength = by_kind["coffee_strength"]
+        assert isinstance(strength, ParamInfo)
+        assert strength.choices  # (name, value_hex) pairs
+        assert "strength" in strength.cli_keys
+        assert strength.live_verified is True
+        # Ranged/ml param: min–max, step, unit, live-verified.
+        water = by_kind["water_amount"]
+        assert (water.minimum, water.maximum, water.step, water.unit) == (
+            25,
+            240,
+            5,
+            "ml",
+        )
+        assert "water" in water.cli_keys and "ml" in water.cli_keys
+        assert water.live_verified is True
+        # Milk params: seconds, NOT live-verified.
+        milk = by_kind["milk_foam_amount"]
+        assert milk.unit == "s"
+        assert milk.live_verified is False
+        assert by_kind["milk_break"].live_verified is False
+        # format() names the product; the caveat is surfaced.
+        text = cat.format()
+        assert "latte_macchiato  (0x07)" in text
+        assert "not live-verified" in text
+        # to_dict() is structured and matches the resolvable name.
+        d = cat.to_dict()
+        assert d["machine_code"] == "EF538"
+        assert any(p["name"] == "latte_macchiato" for p in d["products"])
+        # Inactive products (Powderproduct 0x0F, Active="false") excluded.
+        assert all(p.code != 0x0F for p in cat.products)
+    finally:
+        c.close()
+
+
+def test_products_without_profile_is_refused(sim) -> None:
+    c = _paired(sim)  # no profile loaded
+    try:
+        with pytest.raises(CommandError, match="machine profile"):
+            run_named(c, "products", [], timeout=1.0)
+    finally:
+        c.close()
 
 
 def test_set_pin_validates_numeric(sim) -> None:

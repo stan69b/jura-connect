@@ -584,6 +584,12 @@ wire. `JuraClient.brew()` / `ProductDef.build_recipe_hex()` are the
 library entry points; a full hex blob is still accepted verbatim as
 an escape hatch for firmware variants with a different layout.
 
+The `products` command lists every brewable product on the connected
+machine with its resolvable name and each `param=value` key's allowed
+values (ranges/steps for water & milk, item choices for strength &
+temperature) — built from the same profile, with no extra machine
+I/O. Use it to discover exactly what `brew` accepts.
+
 ---
 
 ## 6. Machine variants (`MachineProfile`)

@@ -74,6 +74,15 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   **Not live-verified — may misbrew, verify on your hardware.** They
   are encoded from the XML (ml kinds ÷5 ticks, seconds as-is); only
   water and temperature are confirmed against a physical machine.
+- **CLI: `products`** — a non-destructive command that lists every
+  brewable product on the connected machine with its resolvable name
+  and each `brew` `param=value` key's allowed values (min–max/step
+  with units for water & milk, ordered item choices for strength &
+  temperature), read from the loaded machine profile with no extra
+  machine I/O. Params that are not live-verified (bypass/milk) carry
+  the caveat. Returns a `ProductCatalogue` result with `.format()`
+  (human tree) and `.to_dict()` (structured). Use it to discover
+  exactly what `brew` accepts.
 
 ## [0.9.4] — 2026-05-12
 
