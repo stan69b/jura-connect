@@ -419,7 +419,6 @@ def _r_brew(_spec, client, args, timeout):
 _NOT_LIVE_VERIFIED_KINDS = frozenset(
     {
         profile.KIND_BYPASS,
-        profile.KIND_MILK_FOAM_AMOUNT,
         profile.KIND_MILK_BREAK,
     }
 )
@@ -429,6 +428,7 @@ _NOT_LIVE_VERIFIED_CAVEAT = "not live-verified — may misbrew, verify on your h
 _KIND_UNIT: dict[str, tuple[str, str]] = {
     profile.KIND_WATER_AMOUNT: ("ml", "value ÷ 5 = 5 ml wire ticks"),
     profile.KIND_BYPASS: ("ml", "value ÷ 5 = 5 ml wire ticks"),
+    profile.KIND_MILK_AMOUNT: ("s", "seconds, sent as-is"),
     profile.KIND_MILK_FOAM_AMOUNT: ("s", "seconds, sent as-is"),
     profile.KIND_MILK_BREAK: ("s", "seconds, sent as-is"),
 }
