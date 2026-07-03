@@ -4,9 +4,9 @@ All notable changes to `jura-connect` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.10.0] — 2026-07-02
+## [0.11.0] — 2026-07-03
 
-### Added (unreleased)
+### Added
 - **`milk_amount` (F5 → blob byte 4) is now a public, settable recipe
   parameter** — `KIND_MILK_AMOUNT`, listed in `RECIPE_PARAM_KINDS`, a
   `milk=` kwarg on `JuraClient.brew`, and a `milk_amount=<s>` key for
@@ -19,7 +19,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   both phases, so `milk_foam_amount` also drops its not-live-verified
   caveat.
 
-### Fixed (unreleased)
+### Fixed
 - **`build_recipe_hex` no longer raises on machines with sub-indexed
   recipe arguments.** `MILK_FOAM_TEMP` / `MILK_TEMP` carry
   `Argument="F14_1"` / `"F14_2"`, which `int()` happily parses as
@@ -27,6 +27,8 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   "offset" far outside the 16-byte blob and making every Z10 milk
   product unbrewable. Sub-indexed arguments (unknown wire semantics)
   are now skipped during profile parsing.
+
+## [0.10.0] — 2026-07-02
 
 ### Changed (breaking)
 - **`decalc` renamed to `descale` across the whole API.** The CLI
