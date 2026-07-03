@@ -6,6 +6,28 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.10.0] — 2026-07-02
 
+### Added (unreleased)
+- **`milk_amount` (F5 → blob byte 4) is now a public, settable recipe
+  parameter** — `KIND_MILK_AMOUNT`, listed in `RECIPE_PARAM_KINDS`, a
+  `milk=` kwarg on `JuraClient.brew`, and a `milk_amount=<s>` key for
+  the CLI `brew` command. Z10-class machines split milk into a liquid
+  phase (`MILK_AMOUNT`, F5) and a foam phase (`MILK_FOAM_AMOUNT`, F6);
+  previously the liquid phase always brewed at its XML default. Both
+  bytes are now **live-verified on a Z10 (EA)/EF545**: blob
+  `05000812030202000100000000000000` (Milkcoffee, strength 8, 90 ml,
+  milk 3 s, foam 2 s, temp high) brewed with the physical pour matching
+  both phases, so `milk_foam_amount` also drops its not-live-verified
+  caveat.
+
+### Fixed (unreleased)
+- **`build_recipe_hex` no longer raises on machines with sub-indexed
+  recipe arguments.** `MILK_FOAM_TEMP` / `MILK_TEMP` carry
+  `Argument="F14_1"` / `"F14_2"`, which `int()` happily parses as
+  `141` / `142` (PEP 515 underscore separators) — putting their
+  "offset" far outside the 16-byte blob and making every Z10 milk
+  product unbrewable. Sub-indexed arguments (unknown wire semantics)
+  are now skipped during profile parsing.
+
 ### Changed (breaking)
 - **`decalc` renamed to `descale` across the whole API.** The CLI
   command is now `descale` (was `decalc`), the maintenance-counter
