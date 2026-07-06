@@ -6,6 +6,7 @@ __pycache__/
 # Nix build artefacts
 /result
 /result-*
+/build/
 
 # Reverse-engineering source material (kept locally, not tracked)
 /apk/
