@@ -55,6 +55,24 @@ If you prefer to execute it directly instead:
 That opens a new interactive bash/zsh subshell with the same `.venv/`
 already activated. Exit that shell to return to your previous prompt.
 
+## Helper Scripts
+
+For a single "current" machine workflow, the repo also ships tiny shell
+wrappers in [`scripts/`](scripts/):
+
+```sh
+./scripts/pair.sh 192.168.1.42 1234 EF1091
+./scripts/products.sh
+./scripts/brew.sh espresso strength=7 water=35
+```
+
+By default they store and use the machine name `current`. Override that
+alias with `JURA_MACHINE_NAME=Kaffeebert` if you want multiple saved
+machines, `JURA_STORE=/path/to/credentials.json` if you want them to use
+a non-default credential store, and `JURA_MACHINE_TYPE=EF1091` if you
+want to force a profile for profile-driven commands like `products.sh`
+and `brew.sh`.
+
 ## Quickstart
 
 ### Pair a new machine (one-time, requires physical access)
