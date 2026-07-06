@@ -113,6 +113,7 @@ def test_pair_accepts_pin_flag(sim_factory, tmp_path, capsys) -> None:
     assert creds is not None
     assert creds.conn_id == "cli-pin-tests"
     assert creds.auth_hash
+    assert creds.pin == "1234"
 
 
 def test_command_missing_credentials_errors(capsys, tmp_path) -> None:
@@ -208,6 +209,97 @@ def test_command_uses_pin_flag(sim_factory, tmp_path, capsys) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "machine info" in out
+
+
+def test_command_uses_stored_pin(sim_factory, tmp_path, capsys) -> None:
+    sim = sim_factory(pin="1234")
+    host, port = sim.address
+    store_path = tmp_path / "creds.json"
+
+    rc = main(
+        [
+            "--store",
+            str(store_path),
+            "pair",
+            f"{host}:{port}",
+            "--name",
+            "SimPin",
+            "--conn-id",
+            "cli-pin-tests",
+            "--pin",
+            "1234",
+            "--timeout",
+            "3",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "--store",
+            str(store_path),
+            "command",
+            "--name",
+            "SimPin",
+            "--handshake-timeout",
+            "3",
+            "--cmd-timeout",
+            "3",
+            "info",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "machine info" in out
+
+
+def test_command_reports_missing_stored_pin(sim_factory, tmp_path, capsys) -> None:
+    sim = sim_factory(pin="1234")
+    host, port = sim.address
+    store_path = tmp_path / "creds.json"
+
+    from jura_connect.client import JuraClient
+    from jura_connect.credentials import CredentialStore, MachineCredentials
+
+    client = JuraClient(
+        host,
+        port=port,
+        conn_id="cli-pin-tests",
+        auth_hash="",
+        pin="1234",
+    )
+    result = client.pair(timeout=2.0)
+    client.close()
+    assert result.new_hash
+
+    CredentialStore(store_path).put(
+        MachineCredentials(
+            name="SimPin",
+            address=f"{host}:{port}",
+            conn_id="cli-pin-tests",
+            auth_hash=result.new_hash,
+        )
+    )
+
+    rc = main(
+        [
+            "--store",
+            str(store_path),
+            "command",
+            "--name",
+            "SimPin",
+            "--handshake-timeout",
+            "3",
+            "--cmd-timeout",
+            "3",
+            "info",
+        ]
+    )
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "handshake -> WRONG_PIN" in captured.out
+    assert "requires a PIN but no PIN is stored" in captured.err
 
 
 def test_command_list_groups_safe_and_destructive(capsys) -> None:

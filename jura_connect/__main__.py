@@ -191,6 +191,7 @@ def cmd_pair(args: argparse.Namespace) -> int:
         address=args.address,
         conn_id=conn_id,
         auth_hash=result.new_hash,
+        pin=args.pin or None,
         machine_type=machine_type,
     )
     store.put(creds)
@@ -244,6 +245,8 @@ def cmd_command(args: argparse.Namespace) -> int:
     address = args.address or (creds.address if creds else None)
     conn_id = args.conn_id or (creds.conn_id if creds else DEFAULT_CONN_ID)
     auth_hash = args.auth_hash or (creds.auth_hash if creds else "")
+    stored_pin = creds.pin if creds else None
+    pin = args.pin if args.pin is not None else (stored_pin or "")
     if not address:
         print("no address: pass --address or --name", file=sys.stderr)
         return 2
@@ -271,7 +274,7 @@ def cmd_command(args: argparse.Namespace) -> int:
         port=port,
         conn_id=conn_id,
         auth_hash=auth_hash,
-        pin=args.pin or "",
+        pin=pin,
         profile=profile,
     )
     try:
@@ -282,6 +285,18 @@ def cmd_command(args: argparse.Namespace) -> int:
         return 2
     print(f"handshake -> {handshake.state}  ({handshake.code})", file=info_stream)
     if handshake.state != "CORRECT":
+        if (
+            handshake.state == "WRONG_PIN"
+            and args.pin is None
+            and not stored_pin
+            and creds is not None
+        ):
+            print(
+                f"machine {args.name!r} requires a PIN but no PIN is stored. "
+                "Re-pair with `jura-connect pair --pin ...` or pass `--pin` "
+                "to this command.",
+                file=sys.stderr,
+            )
         client.close()
         return 2
 
