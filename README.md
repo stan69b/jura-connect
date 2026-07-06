@@ -37,6 +37,24 @@ pip install .                    # adds the `jura-connect` console script
 python -m jura_connect discover
 ```
 
+For a local development virtualenv in this repo, use the helper script:
+
+```sh
+. ./venv.sh
+```
+
+That creates `.venv/` on first use, reuses it afterwards, and activates it
+in the current shell.
+
+If you prefer to execute it directly instead:
+
+```sh
+./venv.sh
+```
+
+That opens a new interactive bash/zsh subshell with the same `.venv/`
+already activated. Exit that shell to return to your previous prompt.
+
 ## Quickstart
 
 ### Pair a new machine (one-time, requires physical access)
