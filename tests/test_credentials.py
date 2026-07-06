@@ -16,6 +16,7 @@ def test_store_round_trip(tmp_path) -> None:
         address="192.168.1.42",
         conn_id="device-A",
         auth_hash="A" * 64,
+        pin="1234",
     )
     store.put(creds)
     got = store.get("Kaffeebert")
@@ -23,12 +24,14 @@ def test_store_round_trip(tmp_path) -> None:
     assert got.address == "192.168.1.42"
     assert got.conn_id == "device-A"
     assert got.auth_hash == "A" * 64
+    assert got.pin == "1234"
     assert got.paired_at  # filled in automatically
 
     # File is valid JSON with the documented shape.
     data = json.loads((tmp_path / "creds.json").read_text())
     assert data["version"] == 1
     assert "Kaffeebert" in data["machines"]
+    assert data["machines"]["Kaffeebert"]["pin"] == "1234"
 
 
 def test_store_lists_and_removes(tmp_path) -> None:

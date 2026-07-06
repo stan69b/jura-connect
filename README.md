@@ -112,7 +112,9 @@ set 'Kaffeebert' machine type to EF1091 -> /home/you/.local/share/jura-connect/c
 $ jura-connect command --name Kaffeebert --machine-type EF1091 brews
 ```
 
-PIN-protected machines also need the PIN on later reconnects:
+PIN-protected machines persist the PIN in the credential store when you
+pair with `--pin`, so later reconnects reuse it automatically. You only
+need `--pin` again if you did not store one yet or want to override it:
 
 ```sh
 $ jura-connect command --name Kaffeebert --pin 808080 info
