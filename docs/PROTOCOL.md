@@ -645,6 +645,9 @@ reply (offset 68..70, BE u16) and looks the EF code up in this table.
 On firmwares that don't answer unicast UDP (notably TT237W) the
 lookup fails — pass `--machine-type EF1091` explicitly, or retro-fit
 later with ``jura-connect set-machine-type --name … EF1091``.
+Machines with a setup PIN also need `--pin <digits>` on both
+`jura-connect pair` and later `jura-connect command` reconnects so the
+CLI sends `@HP:<pin>,...` instead of an empty PIN field.
 
 `jura_connect.profile.iter_profiles()` parses every bundled XML once
 and caches the result via `lru_cache`. Loading a single profile is
@@ -711,7 +714,7 @@ machine.
 │          │ ──────────────────┐
 │          │                   │   open TCP/51515
 │          │                   ▼
-│          │           ┌─────────────┐  @HP:,<conn_id>,    ┌───────────────┐
+│          │           ┌─────────────┐  @HP:<pin>,<conn_id>,┌───────────────┐
 │          │           │ JuraClient  │ ───────────────────►│  dongle       │
 │          │           │             │                     │  "Connect?"   │
 │          │ ◄────────────────── waiting up to 60 s … ─────│  dialog       │

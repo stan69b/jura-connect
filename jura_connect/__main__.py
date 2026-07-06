@@ -4,7 +4,7 @@ Subcommands::
 
     discover         broadcast for machines on the LAN (TCP fallback)
     probe <ip>       send a unicast UDP scan probe to a known IP
-    pair <ip>        run the unset-PIN pairing flow and persist the hash
+    pair <ip>        run the pairing flow and persist the hash
     command <name>   run a named read command against a paired machine
     creds            inspect or remove stored credentials
 
@@ -137,8 +137,15 @@ def _resolve_machine_type(explicit: str | None, address: str) -> tuple[str | Non
 def cmd_pair(args: argparse.Namespace) -> int:
     store = CredentialStore(args.store)
     conn_id = args.conn_id or JuraClient.random_conn_id()
-    client = JuraClient(args.address, conn_id=conn_id, auth_hash="")
-    print(f"connecting to {args.address}:{JURA_PORT} as conn-id {conn_id!r}")
+    host, port = _split_host_port(args.address)
+    client = JuraClient(
+        host,
+        port=port,
+        conn_id=conn_id,
+        auth_hash="",
+        pin=args.pin or "",
+    )
+    print(f"connecting to {host}:{port} as conn-id {conn_id!r}")
     print("look at the coffee machine -- a 'Connect' prompt should appear.")
     try:
         result = client.pair(
@@ -264,6 +271,7 @@ def cmd_command(args: argparse.Namespace) -> int:
         port=port,
         conn_id=conn_id,
         auth_hash=auth_hash,
+        pin=args.pin or "",
         profile=profile,
     )
     try:
@@ -479,7 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pa = sub.add_parser(
         "pair",
-        help="run the unset-PIN pair flow; user accepts on the machine",
+        help="run the pair flow; pass --pin if the machine requires one",
     )
     pa.add_argument("address")
     pa.add_argument(
@@ -496,6 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_PAIR_TIMEOUT,
         help="max time to wait for user to press OK on the machine",
+    )
+    pa.add_argument(
+        "--pin",
+        help="numeric machine setup PIN to include in the @HP handshake",
     )
     pa.add_argument(
         "--machine-type",
@@ -530,6 +542,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cm.add_argument("--conn-id")
     cm.add_argument("--auth-hash")
+    cm.add_argument(
+        "--pin",
+        help="numeric machine setup PIN to include in the @HP handshake",
+    )
     cm.add_argument(
         "--machine-type",
         help=(

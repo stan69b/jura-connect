@@ -57,6 +57,12 @@ machine type   : EF1091  (discovery)
 saved credentials for 'Kaffeebert' -> /home/you/.local/share/jura-connect/credentials.json
 ```
 
+If the machine has a setup PIN configured, pass it on the handshake:
+
+```sh
+$ jura-connect pair 192.168.1.42 --name Kaffeebert --pin 12345678
+```
+
 The auth-hash is written to `$XDG_DATA_HOME/jura-connect/credentials.json`
 with `0600` permissions. Override the location with the global
 `--store /path/to.json` flag.
@@ -86,6 +92,12 @@ set 'Kaffeebert' machine type to EF1091 -> /home/you/.local/share/jura-connect/c
 
 # Override the stored profile for one invocation
 $ jura-connect command --name Kaffeebert --machine-type EF1091 brews
+```
+
+PIN-protected machines also need the PIN on later reconnects:
+
+```sh
+$ jura-connect command --name Kaffeebert --pin 808080 info
 ```
 
 Credentials without a `machine_type` field fall through to the EF536
@@ -463,6 +475,7 @@ for m in discover(timeout=4.0):
     print(m.name, m.fw, m.address)
 
 # First-time pair (requires user to press OK on the machine)
+# Set pin="808080" here if the machine requires a setup PIN.
 client = JuraClient("192.168.1.42", conn_id="laptop-1")
 result = client.pair(timeout=60.0,
                      on_user_prompt=lambda msg: print(msg))
