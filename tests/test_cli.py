@@ -82,6 +82,39 @@ def test_command_runs_info_through_simulator(sim, tmp_path, capsys) -> None:
     assert "no_beans" in out
 
 
+def test_pair_accepts_pin_flag(sim_factory, tmp_path, capsys) -> None:
+    sim = sim_factory(pin="1234")
+    host, port = sim.address
+    store_path = tmp_path / "creds.json"
+
+    rc = main(
+        [
+            "--store",
+            str(store_path),
+            "pair",
+            f"{host}:{port}",
+            "--name",
+            "SimPin",
+            "--conn-id",
+            "cli-pin-tests",
+            "--pin",
+            "1234",
+            "--timeout",
+            "3",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "handshake -> CORRECT" in captured.out
+
+    from jura_connect.credentials import CredentialStore
+
+    creds = CredentialStore(store_path).get("SimPin")
+    assert creds is not None
+    assert creds.conn_id == "cli-pin-tests"
+    assert creds.auth_hash
+
+
 def test_command_missing_credentials_errors(capsys, tmp_path) -> None:
     rc = main(
         [
@@ -125,13 +158,13 @@ def test_creds_json_output(capsys, tmp_path) -> None:
 # --------------------------------------------------------------------- #
 
 
-def _setup_paired_simulator(sim, tmp_path):
+def _setup_paired_simulator(sim, tmp_path, *, pin: str = ""):
     """Pair against the simulator and return (host, port, store_path, hash)."""
     host, port = sim.address
     from jura_connect.client import JuraClient
     from jura_connect.credentials import CredentialStore, MachineCredentials
 
-    c = JuraClient(host, port=port, conn_id="cli-tests", auth_hash="")
+    c = JuraClient(host, port=port, conn_id="cli-tests", auth_hash="", pin=pin)
     r = c.pair(timeout=2.0)
     c.close()
     assert r.new_hash
@@ -145,6 +178,36 @@ def _setup_paired_simulator(sim, tmp_path):
         )
     )
     return host, port, store_path, r.new_hash
+
+
+def test_command_uses_pin_flag(sim_factory, tmp_path, capsys) -> None:
+    sim = sim_factory(pin="1234")
+    host, port, store_path, h = _setup_paired_simulator(sim, tmp_path, pin="1234")
+    rc = main(
+        [
+            "--store",
+            str(store_path),
+            "command",
+            "--name",
+            "Sim",
+            "--address",
+            f"{host}:{port}",
+            "--auth-hash",
+            h,
+            "--conn-id",
+            "cli-tests",
+            "--pin",
+            "1234",
+            "--handshake-timeout",
+            "3",
+            "--cmd-timeout",
+            "3",
+            "info",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "machine info" in out
 
 
 def test_command_list_groups_safe_and_destructive(capsys) -> None:
